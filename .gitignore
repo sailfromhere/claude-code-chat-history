@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local Claude Code settings (machine-specific permissions)
+.claude/settings.local.json
+
+# Generated artifacts / caches
+.title-cache.json
+
+# macOS
+.DS_Store
