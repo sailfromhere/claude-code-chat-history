@@ -675,6 +675,41 @@ def _diff_lines(old: str, new: str) -> str:
     return f'<div class="diff">{_cap_rows(rows)}</div>'
 
 
+_PLANS_DIR = os.path.join(HOME, ".claude", "plans")
+
+
+def _is_plan_write(name: str, inp: dict) -> bool:
+    """True when this Write call is writing a plan file to ~/.claude/plans/."""
+    if name != "Write" or not isinstance(inp, dict):
+        return False
+    fp = inp.get("file_path", "")
+    return os.path.normpath(fp).startswith(os.path.normpath(_PLANS_DIR))
+
+
+def _render_plan_card(content: str, file_path: str = "", allowed_prompts: list | None = None) -> str:
+    """Render a plan as an expanded markdown card (not a collapsed tool chip)."""
+    path_html = (
+        f'<div class="plan-path">{_esc(file_path)}</div>'
+        if file_path else ""
+    )
+    body_html = _render_text_body(content) if content.strip() else "<em>(empty)</em>"
+    approved_html = ""
+    if allowed_prompts:
+        items = "".join(
+            f'<li>{_esc(p.get("tool",""))}: {_esc(p.get("prompt",""))}</li>'
+            for p in allowed_prompts if isinstance(p, dict)
+        )
+        approved_html = f'<div class="plan-approved"><b>Approved actions:</b><ul>{items}</ul></div>'
+    return (
+        f'<div class="plan-card">'
+        f'<div class="plan-header">📋 Plan</div>'
+        f'{path_html}'
+        f'{body_html}'
+        f'{approved_html}'
+        f'</div>'
+    )
+
+
 def _render_edit_diff(name: str, inp: dict) -> str:
     """Red/green diff view for Edit/MultiEdit/Write tool calls."""
     path = inp.get("file_path", "")
@@ -726,6 +761,15 @@ def _render_tool_use(block: dict, result: dict | None) -> str:
     # AskUserQuestion is conversation, not tool noise → render as a visible Q&A card.
     if name == "AskUserQuestion":
         return _render_askq(inp, result)
+
+    # Write to ~/.claude/plans/ → render as an expanded plan card.
+    # ExitPlanMode also carries input.plan (old format) but we ignore it here because
+    # the Write call already rendered the same content — don't show it twice.
+    if _is_plan_write(name, inp):
+        return _render_plan_card(
+            str(inp.get("content", "")),
+            file_path=inp.get("file_path", ""),
+        )
 
     err = bool(result and result.get("is_error"))
     cls = "tool tool-use error" if err else "tool tool-use"
@@ -846,8 +890,8 @@ def _render_turns(s: Session) -> list[Turn]:
 
 
 def _has_visible_nontool(entry: dict) -> bool:
-    """Does the entry render anything that survives 'hide tool calls'? (text or an
-    AskUserQuestion card — both stay visible; plain tool_use/tool_result do not.)"""
+    """Does the entry render anything that survives 'hide tool calls'? (text, an
+    AskUserQuestion card, or a plan card — all stay visible; plain tool_use/result don't.)"""
     c = _content(entry)
     if isinstance(c, str):
         return bool(c.strip())
@@ -857,8 +901,13 @@ def _has_visible_nontool(entry: dict) -> bool:
                 continue
             if b.get("type") == "text" and b.get("text", "").strip():
                 return True
-            if b.get("type") == "tool_use" and b.get("name") == "AskUserQuestion":
-                return True
+            if b.get("type") == "tool_use":
+                name = b.get("name", "")
+                inp = b.get("input", {})
+                if name == "AskUserQuestion":
+                    return True
+                if _is_plan_write(name, inp):
+                    return True
     return False
 
 
@@ -1486,6 +1535,12 @@ font-size:12.5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .d-ctx .d-code{color:var(--muted)}
 .d-hunk .d-code{color:var(--accent)}
 @media (prefers-color-scheme:dark){.d-add .d-code{color:#3fb950}.d-del .d-code{color:#f85149}}
+/* Plan card — ExitPlanMode / Write-to-plan rendered as expanded markdown */
+.plan-card{border-left:3px solid #7c6af7;background:var(--bg2,var(--badge));border-radius:6px;padding:12px 16px;margin:8px 0}
+.plan-header{font-weight:600;color:#7c6af7;font-size:.82em;letter-spacing:.04em;margin-bottom:6px}
+.plan-path{font-size:.72em;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin-bottom:8px}
+.plan-approved{font-size:.8em;color:var(--muted);margin-top:10px;border-top:1px solid var(--line);padding-top:6px}
+.plan-approved ul{margin:4px 0 0;padding-left:1.2em}.plan-approved li{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin:2px 0}
 /* AskUserQuestion shown as a Q&A card (not hidden by the tool toggle) */
 .askq{border:1px solid var(--accent);border-radius:10px;padding:10px 12px;margin:10px 0;background:var(--badge)}
 .askq-q{font-weight:600;margin-bottom:8px}

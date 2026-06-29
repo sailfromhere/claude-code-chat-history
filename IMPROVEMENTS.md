@@ -87,6 +87,25 @@ this range" — less useful than it looks, and arguably misleading for spend-by-
 - **User decision (2026-06-11):** noted, deferred — needs thinking through. Do not implement yet.
 - **Status:** TBD.
 
+### Plan-mode rendering — Built (2026-06-29)
+`Write` tool calls targeting `~/.claude/plans/*.md` now render as expanded markdown cards
+(not collapsed diffs). Card shows a `📋 Plan` header, file path, rendered markdown body, and
+an optional "Approved actions" list (from `allowedPrompts` in old-format `ExitPlanMode` calls).
+
+Key design decisions:
+- **Always visible** — plan cards escape the Tools toggle. `_has_visible_nontool()` now counts
+  `_is_plan_write()` as visible, so the assistant turn is never `tools-only`. CSS class `plan-card`
+  has no `tool-use` class → not hidden by `body.hide-tools .tool-use{display:none}`.
+- **Single source** — old sessions have both a `Write` AND an `ExitPlanMode` with `input.plan`
+  inline (same content). Only the `Write` renders a card; `ExitPlanMode` falls back to the normal
+  collapsed chip. Avoids double-rendering.
+- **Data-shape:** current format → `Write` to `~/.claude/plans/*.md` + near-empty `ExitPlanMode`;
+  old format → same Write + `ExitPlanMode` with `plan`/`planFilePath`/`allowedPrompts` fields.
+  Plan-mode also emits `attachment {type:"plan_mode", planFilePath, planExists}` in user turns —
+  metadata Claude uses; not rendered by the dashboard.
+
+**Status:** Built.
+
 ### Header meta row justified instead of left-aligned — Fixed (2026-06-16)
 **Symptom:** the transcript-pane header's second row (project badge · date range · `Np · Nr` ·
 usage) spread across the pane (project badge stranded left, the rest flung right) instead of the
