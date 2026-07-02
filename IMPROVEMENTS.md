@@ -9,6 +9,11 @@ Status values: `TBD` | `Decided: <summary>` | `Built`
 
 ---
 
+## Log — 2026-07-01
+
+- **Pricing table refresh** — `Built:` added `claude-fable-5` / `claude-mythos-5` ($10/$50 per MTok) and `claude-sonnet-5` ($3/$15, standard rate — not the temporary $2/$10 intro) to `PRICING` in `chats_dashboard.py`. Sonnet 5 and Fable/Mythos sessions were previously counted as unpriced (shown with the `+` incomplete-cost marker).
+- **Sticky date-header leak fix** — `Built:` the pinned group header (`TODAY`, etc.) left a gap on top through which the previous card leaked. Root cause: the `.cardlist` scroll container's `padding-top:10px` — a `position:sticky;top:0` element is clamped to its containing block (padding-excluded content box), so top padding pins the header that far below the scrollport and content scrolls through the gap. Fix: `.cardlist{padding:0 10px 10px}` + `.cardlist>:first-child{margin-top:10px}` for breathing room; header keeps opaque `--bg` + `z-index:10`. NOT the flex `gap` (a first attempt covering the flex gap did nothing). Verified with headless system Chrome (extension was down) — see project memory `build-test-harness-learnings`.
+
 ## Pivot 2026-06-10 — product is now a dashboard, not a single-chat exporter
 
 The slash command now opens a **static HTML dashboard** to browse *all* Claude Code history.

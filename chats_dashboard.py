@@ -58,9 +58,12 @@ ACTIVE_WINDOW_MIN = 15  # a session is "active" if its last activity is within t
 # Public API list prices, USD per million tokens: (input, output).
 # Cache read ≈ 0.1× input; cache write (5-min) ≈ 1.25× input.
 PRICING = {
+    "claude-fable-5": (10.0, 50.0),
+    "claude-mythos-5": (10.0, 50.0),
     "claude-opus-4-8": (5.0, 25.0),
     "claude-opus-4-7": (5.0, 25.0),
     "claude-opus-4-6": (5.0, 25.0),
+    "claude-sonnet-5": (3.0, 15.0),
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
 }
@@ -1422,9 +1425,15 @@ cursor:pointer;font-size:13px;display:flex;align-items:center;gap:7px;flex-wrap:
 .count{color:var(--muted);font-size:11px}
 .pcost{flex-basis:100%;color:var(--muted);font-size:10.5px;font-weight:400;padding-left:16px}
 .sessioncol{width:var(--sessw);flex:none;display:flex;flex-direction:column;min-height:0;border-right:1px solid var(--line)}
-.cardlist{flex:1;overflow:auto;padding:10px;display:flex;flex-direction:column;gap:8px}
+/* No top padding on the scroll container: a position:sticky header is clamped to its
+   containing block (the padding-excluded content box), so a padding-top would pin the header
+   that many px BELOW the scrollport top and let cards scroll through the gap above it. Top
+   breathing room is restored on the first child instead — it scrolls away and doesn't offset
+   the pin. (z-index/opaque bg on the header are belt-and-suspenders for paint order.) */
+.cardlist{flex:1;overflow:auto;padding:0 10px 10px;display:flex;flex-direction:column;gap:8px}
+.cardlist>:first-child{margin-top:10px}
 .group-header{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;
-color:var(--muted);padding:6px 4px 2px;position:sticky;top:0;background:var(--bg);
+color:var(--muted);padding:6px 4px 2px;position:sticky;top:0;z-index:10;background:var(--bg);
 display:flex;justify-content:space-between;align-items:baseline;gap:8px}
 .group-tally{font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;white-space:nowrap}
 .card{display:block;text-decoration:none;color:inherit;background:var(--panel);
