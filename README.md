@@ -116,8 +116,9 @@ The dashboard estimates costs using public Claude API list prices. Models tracke
 
 | Model | Input (per 1M tokens) | Output (per 1M tokens) |
 |-------|----------------------|------------------------|
+| Fable 5 / Mythos 5 | $10.00 | $50.00 |
 | Opus 4.6–4.8 | $5.00 | $25.00 |
-| Sonnet 4.6 | $3.00 | $15.00 |
+| Sonnet 4.6 / Sonnet 5 | $3.00 | $15.00 |
 | Haiku 4.5 | $1.00 | $5.00 |
 
 Cache reads are priced at 10% of input; cache writes at 125% of input. Sessions using unrecognized models show token counts but no dollar estimate.
