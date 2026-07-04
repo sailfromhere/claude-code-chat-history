@@ -30,6 +30,8 @@ cd claude-code-chat-history
 python3 chats_dashboard.py --open
 ```
 
+> **Windows:** use `python` instead of `python3` (Windows' python.org installer doesn't ship a `python3` shim).
+
 The dashboard is written to `~/.claude/history-dashboard/` by default. You can bookmark `index.html` and open it anytime without re-running the script.
 
 ## Usage
@@ -45,23 +47,41 @@ Options:
   --output-dir DIR      Output directory (default: ~/.claude/history-dashboard)
 ```
 
-### Shell alias (recommended)
+### Command shortcut (recommended)
 
-Add to your `~/.zshrc` or `~/.bashrc`:
+**macOS / Linux (bash or zsh)** — add to your `~/.zshrc` or `~/.bashrc`:
 
 ```bash
 alias chats='python3 /path/to/chats_dashboard.py --open'
 ```
 
+**Windows (PowerShell)** — add a function to your PowerShell profile (find its path with `$PROFILE`):
+
+```powershell
+function chats { python C:\path\to\chats_dashboard.py --open }
+```
+
+**WSL / Git Bash on Windows** — these run bash, so the macOS/Linux `alias` snippet above works unchanged.
+
 Then just run `chats` to regenerate and view the dashboard.
 
 ### Claude Code slash command
 
-Copy the included command file to use `/chats` from within any Claude Code session:
+Copy the included command file to use `/chats` from within any Claude Code session.
+
+**macOS / Linux / WSL / Git Bash:**
 
 ```bash
 cp chats.md ~/.claude/commands/chats.md
 ```
+
+**Windows (PowerShell):**
+
+```powershell
+Copy-Item chats.md $env:USERPROFILE\.claude\commands\chats.md
+```
+
+(`~/.claude` resolves to `%USERPROFILE%\.claude` on Windows.)
 
 ## How it works
 
@@ -104,10 +124,11 @@ Cache reads are priced at 10% of input; cache writes at 125% of input. Sessions 
 
 ## Requirements
 
-- **Python 3.7+** (uses dataclasses and `from __future__ import annotations`)
+- **Python 3.7+** (uses dataclasses and `from __future__ import annotations`). On Windows, the command is usually `python` (or `py`) rather than `python3` — swap it in wherever `python3` appears in this README.
 - **No third-party packages** — stdlib only
 - Claude Code installed (it produces the JSONL history files this tool reads)
 - `claude` CLI on your PATH (only needed for `--open` and LLM title generation; `--no-titles` skips it)
+- Works on macOS, Linux, and Windows (native, WSL, or Git Bash) — `~/.claude/...` paths resolve to `%USERPROFILE%\.claude\...` on native Windows.
 
 ## Tests
 
