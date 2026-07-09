@@ -41,6 +41,19 @@ class TestUsage(unittest.TestCase):
         self.assertTrue(s.cost_complete)
         self.assertEqual(s.cost_usd, 0.0)
 
+    def test_dated_model_id_prices_via_prefix(self):
+        # Official ids elsewhere carry a -YYYYMMDD suffix; a dated id must match
+        # its base model's price instead of counting as unpriced.
+        s = make_session([assistant_usage("claude-haiku-4-5-20251001", input=M, output=M)])
+        self.assertTrue(s.cost_complete)
+        self.assertAlmostEqual(s.cost_usd, 1.0 + 5.0, places=6)
+
+    def test_prefix_match_requires_dash_boundary(self):
+        # "claude-sonnet-55" must NOT match "claude-sonnet-5" pricing.
+        s = make_session([assistant_usage("claude-sonnet-55", input=M)])
+        self.assertFalse(s.cost_complete)
+        self.assertEqual(s.cost_usd, 0.0)
+
     def test_multiple_models_sum(self):
         s = make_session([
             assistant_usage("claude-opus-4-8", input=M),

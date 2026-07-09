@@ -171,6 +171,13 @@ def ai_title_line(session_id: str, title: str) -> dict:
     return {"type": "ai-title", "sessionId": session_id, "aiTitle": title}
 
 
+def agent_name_line(session_id: str, name: str) -> dict:
+    """An agent-name JSONL line — the harness-assigned session display name
+    (kebab-case, e.g. 'fix-sticky-header-gap'). Marks its OWN session; a session
+    can carry several as work progresses (the last one is current)."""
+    return {"type": "agent-name", "sessionId": session_id, "agentName": name}
+
+
 # --- assembling sessions / files ------------------------------------------- #
 def make_session(entries: list[dict], *, session_id: str = "s1",
                  project: str = "/Users/x/myproj", ai_title: str | None = None) -> "cd.Session":

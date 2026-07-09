@@ -107,6 +107,7 @@ class Session:
     project_path: str = ""
     entries: list[dict] = field(default_factory=list)  # raw user/assistant entries
     ai_title: str | None = None
+    agent_name: str = ""  # harness-assigned session display name (last agent-name line)
 
     # computed
     first_ts: str = ""
@@ -140,8 +141,19 @@ def load_sessions(projects_dir: str) -> list[Session]:
     """Read every .jsonl under projects_dir, grouping entries by sessionId."""
     sessions: dict[str, Session] = {}
     titles: dict[str, str] = {}
+    agent_names: dict[str, str] = {}
 
-    for path in glob.glob(os.path.join(projects_dir, "*", "*.jsonl")):
+    def _mtime(p: str) -> float:
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return 0.0
+
+    # Oldest file first: entries get re-sorted by timestamp anyway, but
+    # timestamp-less lines (agent-name) rely on "last read wins" being
+    # chronological — the current name lives in the most recently written file.
+    for path in sorted(glob.glob(os.path.join(projects_dir, "*", "*.jsonl")),
+                       key=lambda p: (_mtime(p), p)):
         for line in _iter_jsonl(path):
             etype = line.get("type")
             if etype == "ai-title":
@@ -149,6 +161,14 @@ def load_sessions(projects_dir: str) -> list[Session]:
                 t = line.get("aiTitle")
                 if sid and t:
                     titles[sid] = t
+                continue
+            if etype == "agent-name":
+                # Harness-assigned display name for its OWN session (the name the
+                # Claude Code UI shows). Renames accrue; the last one is current.
+                sid = line.get("sessionId")
+                nm = line.get("agentName")
+                if sid and nm:
+                    agent_names[sid] = nm
                 continue
             if etype not in ("user", "assistant"):
                 continue
@@ -168,6 +188,7 @@ def load_sessions(projects_dir: str) -> list[Session]:
             continue
         s.entries.sort(key=lambda e: e.get("timestamp") or "")
         s.ai_title = titles.get(sid)
+        s.agent_name = agent_names.get(sid, "")
         _compute_metadata(s)
         result.append(s)
 
@@ -224,9 +245,12 @@ def _compute_metadata(s: Session) -> None:
 
     _compute_usage(s)
 
-    # Prefer the AI title; then a human snippet; then the command issued; else untitled.
+    # Prefer the AI title; then the harness-assigned session name (what Claude
+    # Code's own UI shows); then a human snippet; then the command; else untitled.
     if s.ai_title:
         s.title = s.ai_title
+    elif s.agent_name:
+        s.title = _truncate(s.agent_name, TITLE_FALLBACK_CHARS)
     elif s.snippet:
         s.title = _truncate(s.snippet, TITLE_FALLBACK_CHARS)
     elif first_command:
@@ -234,6 +258,21 @@ def _compute_metadata(s: Session) -> None:
         s.snippet = s.snippet or first_command
     else:
         s.title = "(untitled session)"
+
+
+def _price_for(model) -> tuple[float, float] | None:
+    """(input, output) $/MTok for a model id. Exact match first, then a
+    dash-boundary prefix match so date-suffixed ids (claude-haiku-4-5-20251001)
+    price as their base model instead of counting as unpriced."""
+    if not isinstance(model, str) or not model:
+        return None
+    price = PRICING.get(model)
+    if price is not None:
+        return price
+    for known, p in PRICING.items():
+        if model.startswith(known + "-"):
+            return p
+    return None
 
 
 def _compute_usage(s: Session) -> None:
@@ -254,7 +293,7 @@ def _compute_usage(s: Session) -> None:
         s.tok_cache_read += cr
         s.tok_cache_write += cw
 
-        price = PRICING.get(msg.get("model"))
+        price = _price_for(msg.get("model"))
         if price is None:
             if msg.get("model") not in (None, "<synthetic>"):
                 s.cost_complete = False
@@ -671,17 +710,17 @@ def _render_text_body(text: str) -> str:
             out.append(f"<blockquote>{_render_text_body(chr(10).join(buf))}</blockquote>")
             continue
 
-        lm = re.match(r"^(\s*)([-*+]|\d+\.)\s+(.*)$", line)        # list
+        lm = re.match(r"^(\s*)([-*+]|\d+\.)\s+(.*)$", line)        # list (may nest)
         if lm:
-            ordered = lm.group(2).endswith(".")
-            tag = "ol" if ordered else "ul"
             items = []
             while i < n:
                 im = re.match(r"^(\s*)([-*+]|\d+\.)\s+(.*)$", lines[i])
                 if not im:
                     break
-                items.append(f"<li>{_inline(im.group(3))}</li>"); i += 1
-            out.append(f"<{tag}>{''.join(items)}</{tag}>")
+                items.append((len(im.group(1).expandtabs(4)),
+                              im.group(2).endswith("."), im.group(3)))
+                i += 1
+            out.append(_render_list(items))
             continue
 
         para = [s]                                                 # paragraph (consume ≥1 line)
@@ -690,6 +729,38 @@ def _render_text_body(text: str) -> str:
             para.append(lines[i].strip()); i += 1
         out.append(f'<p>{"<br>".join(_inline(p) for p in para)}</p>')
     return "\n".join(out)
+
+
+_CHECKBOX_RE = re.compile(r"^\[([ xX])\]\s+(.*)$")
+
+
+def _render_list(items: list[tuple[int, bool, str]]) -> str:
+    """Render consecutive (indent, ordered, text) list items with nesting by
+    indent. Deeper indent opens a nested <ul>/<ol>; shallower pops back out
+    (the outermost list never closes until the end). `- [ ]`/`- [x]` render as
+    checkboxes. Bounded: one pass over items, stack pops are ≤ pushes."""
+    html: list[str] = []
+    stack: list[tuple[int, str]] = []  # (indent, tag) of open lists
+    for indent, ordered, text in items:
+        tag = "ol" if ordered else "ul"
+        if not stack:
+            stack.append((indent, tag))
+            html.append(f"<{tag}>")
+        elif indent > stack[-1][0]:
+            stack.append((indent, tag))
+            html.append(f"<{tag}>")
+        else:
+            while len(stack) > 1 and indent < stack[-1][0]:
+                html.append(f"</{stack.pop()[1]}>")
+        m = _CHECKBOX_RE.match(text)
+        if m:
+            mark = "☑" if m.group(1) in "xX" else "☐"
+            html.append(f'<li class="task">{mark} {_inline(m.group(2))}</li>')
+        else:
+            html.append(f"<li>{_inline(text)}</li>")
+    while stack:
+        html.append(f"</{stack.pop()[1]}>")
+    return "".join(html)
 
 
 def _para_breaks(line: str, nxt: str) -> bool:
@@ -748,12 +819,43 @@ def _is_plan_write(name: str, inp: dict) -> bool:
     return os.path.normpath(fp).startswith(os.path.normpath(_PLANS_DIR))
 
 
-def _render_plan_card(content: str, file_path: str = "", allowed_prompts: list | None = None) -> str:
+def _plan_outcomes(entries: list[dict], results: dict) -> dict[str, str]:
+    """Map plan-Write tool_use id → "approved"/"rejected". The outcome lives on
+    the *ExitPlanMode* call's tool_result ("User has approved your plan…" vs an
+    is_error rejection), so pair each plan write with the next ExitPlanMode call.
+    Consecutive writes before one ExitPlanMode are revisions of the same plan and
+    share its outcome."""
+    pending: list[str] = []
+    out: dict[str, str] = {}
+    for e in entries:
+        c = _content(e)
+        if not isinstance(c, list):
+            continue
+        for b in c:
+            if not isinstance(b, dict) or b.get("type") != "tool_use":
+                continue
+            if _is_plan_write(b.get("name", ""), b.get("input") or {}):
+                if b.get("id"):
+                    pending.append(b["id"])
+            elif b.get("name") == "ExitPlanMode":
+                res = results.get(b.get("id"))
+                if res is not None:
+                    outcome = "rejected" if res.get("is_error") else "approved"
+                    for w in pending:
+                        out[w] = outcome
+                pending = []
+    return out
+
+
+def _render_plan_card(content: str, file_path: str = "", allowed_prompts: list | None = None,
+                      outcome: str = "") -> str:
     """Render a plan as an expanded markdown card (not a collapsed tool chip)."""
     path_html = (
         f'<div class="plan-path">{_esc(file_path)}</div>'
         if file_path else ""
     )
+    badge = {"approved": ' <span class="plan-outcome ok">✓ approved</span>',
+             "rejected": ' <span class="plan-outcome no">✗ rejected</span>'}.get(outcome, "")
     body_html = _render_text_body(content) if content.strip() else "<em>(empty)</em>"
     approved_html = ""
     if allowed_prompts:
@@ -764,7 +866,7 @@ def _render_plan_card(content: str, file_path: str = "", allowed_prompts: list |
         approved_html = f'<div class="plan-approved"><b>Approved actions:</b><ul>{items}</ul></div>'
     return (
         f'<div class="plan-card">'
-        f'<div class="plan-header">📋 Plan</div>'
+        f'<div class="plan-header">📋 Plan{badge}</div>'
         f'{path_html}'
         f'{body_html}'
         f'{approved_html}'
@@ -814,7 +916,8 @@ def _render_askq(inp: dict, result: dict | None) -> str:
     return "".join(out)
 
 
-def _render_tool_use(block: dict, result: dict | None) -> str:
+def _render_tool_use(block: dict, result: dict | None,
+                     plan_outcomes: dict[str, str] | None = None) -> str:
     """One collapsible for a tool call: input plus its paired result (Claude's action)."""
     name = block.get("name", "tool")
     inp = block.get("input", {})
@@ -831,6 +934,7 @@ def _render_tool_use(block: dict, result: dict | None) -> str:
         return _render_plan_card(
             str(inp.get("content", "")),
             file_path=inp.get("file_path", ""),
+            outcome=(plan_outcomes or {}).get(block.get("id"), ""),
         )
 
     err = bool(result and result.get("is_error"))
@@ -872,7 +976,13 @@ def _render_orphan_result(block: dict) -> str:
 def _tool_summary(name: str, inp: dict) -> str:
     if not isinstance(inp, dict):
         return ""
-    for key in ("command", "file_path", "path", "pattern", "query", "url", "prompt"):
+    if name == "TaskUpdate" and inp.get("taskId"):  # delta-shaped: "#3 → completed"
+        status = f' → {inp["status"]}' if inp.get("status") else ""
+        return _truncate(f'#{inp["taskId"]}{status}', 100)
+    # First matching key wins; "description"/"prompt" late so Agent/Task chips show
+    # the human-readable line, and Bash keeps showing its command.
+    for key in ("command", "file_path", "path", "pattern", "query", "url",
+                "skill", "subject", "description", "prompt"):
         if inp.get(key):
             return _truncate(str(inp[key]), 100)
     return ""
@@ -895,6 +1005,7 @@ def _render_turns(s: Session) -> list[Turn]:
     results = _result_map(s.entries)
     consumed: set[str] = set()  # tool_use_ids already shown under their call
     expansions = _expansion_uuids(s.entries)
+    plan_outcomes = _plan_outcomes(s.entries, results)
     entries = s.entries
 
     turns: list[Turn] = []
@@ -952,7 +1063,7 @@ def _render_turns(s: Session) -> list[Turn]:
             if _is_sentinel_assistant(e):
                 i += 1
                 continue
-            inner = _render_assistant_blocks(e, results, consumed)
+            inner = _render_assistant_blocks(e, results, consumed, plan_outcomes)
             if inner.strip():
                 turns.append(Turn("assistant", ts, inner, tools_only=not _has_visible_nontool(e)))
         i += 1
@@ -1024,7 +1135,8 @@ def _render_user_blocks(entry: dict, results: dict, consumed: set) -> str:
     return "\n".join(out)
 
 
-def _render_assistant_blocks(entry: dict, results: dict, consumed: set) -> str:
+def _render_assistant_blocks(entry: dict, results: dict, consumed: set,
+                             plan_outcomes: dict[str, str] | None = None) -> str:
     c = _content(entry)
     out: list[str] = []
     if isinstance(c, list):
@@ -1038,7 +1150,7 @@ def _render_assistant_blocks(entry: dict, results: dict, consumed: set) -> str:
                 res = results.get(b.get("id"))
                 if res is not None:
                     consumed.add(b.get("id"))
-                out.append(_render_tool_use(b, res))
+                out.append(_render_tool_use(b, res, plan_outcomes))
             # thinking: skipped intentionally
     return "\n".join(out)
 
@@ -1229,7 +1341,7 @@ def _index_page(sessions: list[Session]) -> str:
             cards.append(f'<div class="group-header"><span>{_esc(group)}</span>'
                          f'<span class="group-tally"></span></div>')
         blurb = s.summary or s.snippet
-        haystack = _esc(f"{s.title} {s.project_name} {blurb}".lower())
+        haystack = _esc(f"{s.title} {s.agent_name} {s.project_name} {blurb}".lower())
         href = f"sessions/{_esc(s.session_id)}.html"
         active = _is_active(s.last_ts)
         badge = (f'<span class="active-badge" data-tip="{_esc(_active_label(s.last_ts))}">'
@@ -1611,6 +1723,7 @@ padding:7px 10px;border-radius:0 0 6px 6px;border-left:2px solid var(--line);col
 .bubble h1{font-size:1.4em}.bubble h2{font-size:1.25em}.bubble h3{font-size:1.12em}.bubble h4{font-size:1em}
 .bubble ul,.bubble ol{margin:8px 0;padding-left:22px}
 .bubble li{margin:2px 0}
+.bubble li.task{list-style:none;margin-left:-18px}
 .bubble blockquote{margin:8px 0;padding:2px 12px;border-left:3px solid var(--line);color:var(--muted)}
 .bubble a{color:var(--accent)}
 .bubble hr{border:none;border-top:1px solid var(--line);margin:14px 0}
@@ -1639,6 +1752,10 @@ font-size:12.5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .plan-card{border-left:3px solid #7c6af7;background:var(--bg2,var(--badge));border-radius:6px;padding:12px 16px;margin:8px 0}
 .plan-header{font-weight:600;color:#7c6af7;font-size:.82em;letter-spacing:.04em;margin-bottom:6px}
 .plan-path{font-size:.72em;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin-bottom:8px}
+.plan-outcome{font-size:.85em;font-weight:600;padding:1px 7px;border-radius:10px;margin-left:6px}
+.plan-outcome.ok{color:#1a7f37;background:rgba(46,160,67,.15)}
+.plan-outcome.no{color:#cf222e;background:rgba(248,81,73,.15)}
+@media (prefers-color-scheme:dark){.plan-outcome.ok{color:#3fb950}.plan-outcome.no{color:#f85149}}
 .plan-approved{font-size:.8em;color:var(--muted);margin-top:10px;border-top:1px solid var(--line);padding-top:6px}
 .plan-approved ul{margin:4px 0 0;padding-left:1.2em}.plan-approved li{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin:2px 0}
 /* AskUserQuestion shown as a Q&A card (not hidden by the tool toggle) */
@@ -1917,10 +2034,7 @@ def apply_llm_titles(sessions: list[Session], output_dir: str, model: str) -> No
 
 
 def _atomic_write_json(path: str, data: dict) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-    os.replace(tmp, path)
+    _atomic_write_text(path, json.dumps(data, indent=2))  # pid-suffixed temp inside
 
 
 # --------------------------------------------------------------------------- #

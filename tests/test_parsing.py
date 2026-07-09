@@ -3,8 +3,8 @@ import tempfile
 import unittest
 
 from fixtures import (cd, write_jsonl, user_msg, slash_command, assistant_text,
-                      ai_title_line, bash_io, sdk_submitted_msg, typed_msg,
-                      make_session)
+                      ai_title_line, agent_name_line, bash_io, sdk_submitted_msg,
+                      typed_msg, make_session)
 
 
 class TestLoadSessions(unittest.TestCase):
@@ -106,6 +106,76 @@ class TestLoadSessions(unittest.TestCase):
             html = cd._index_page(sessions)
             self.assertIn("⚙ SDK", html)
             self.assertEqual(html.count('class="sdk-pill"'), 1)  # only the sdk session
+
+    def test_agent_name_used_as_title_fallback(self):
+        # The harness-assigned session name beats the snippet-truncation fallback
+        # (it's the name Claude Code's own UI shows) but never the AI title.
+        with tempfile.TemporaryDirectory() as d:
+            write_jsonl(d, "a.jsonl",
+                        [agent_name_line("s1", "fix-sticky-header-gap"),
+                         user_msg("a long human prompt about the sticky header bug")],
+                        session_id="s1")
+            s = cd.load_sessions(d)[0]
+            self.assertEqual(s.title, "fix-sticky-header-gap")
+            self.assertIn("long human prompt", s.snippet)  # snippet unaffected
+
+    def test_ai_title_beats_agent_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_jsonl(d, "a.jsonl",
+                        [agent_name_line("s1", "kebab-name"),
+                         ai_title_line("s1", "Proper AI Title"),
+                         user_msg("hello")],
+                        session_id="s1")
+            s = cd.load_sessions(d)[0]
+            self.assertEqual(s.title, "Proper AI Title")
+
+    def test_last_agent_name_wins(self):
+        # Sessions get renamed as work progresses — the latest name is current.
+        with tempfile.TemporaryDirectory() as d:
+            write_jsonl(d, "a.jsonl",
+                        [agent_name_line("s1", "old-name"),
+                         agent_name_line("s1", "new-name"),
+                         user_msg("hi")],
+                        session_id="s1")
+            self.assertEqual(cd.load_sessions(d)[0].title, "new-name")
+
+    def test_agent_name_last_wins_across_files_by_mtime(self):
+        # agent-name lines carry no timestamp, so "last wins" must follow file
+        # mtime (the current name lives in the most recently written file), not
+        # glob order — a stale rename in an older resumed-session file must lose.
+        import os
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            # "a.jsonl" globs first but is NEWER; "z.jsonl" globs last but is older.
+            newer = write_jsonl(d, "a.jsonl",
+                                [agent_name_line("s1", "current-name"), user_msg("hi")],
+                                session_id="s1")
+            older = write_jsonl(d, "z.jsonl",
+                                [agent_name_line("s1", "stale-name")], session_id="s1")
+            now = time.time()
+            os.utime(older, (now - 100, now - 100))
+            os.utime(newer, (now, now))
+            self.assertEqual(cd.load_sessions(d)[0].title, "current-name")
+
+    def test_agent_name_title_is_length_capped(self):
+        # agentName comes from untrusted jsonl; as a title it must be truncated
+        # like every other title source.
+        with tempfile.TemporaryDirectory() as d:
+            write_jsonl(d, "a.jsonl",
+                        [agent_name_line("s1", "x" * 500), user_msg("hi")],
+                        session_id="s1")
+            s = cd.load_sessions(d)[0]
+            self.assertLessEqual(len(s.title), cd.TITLE_FALLBACK_CHARS)
+
+    def test_agent_name_searchable_even_when_ai_title_shown(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_jsonl(d, "a.jsonl",
+                        [agent_name_line("s1", "kebab-search-target"),
+                         ai_title_line("s1", "Shown Title"),
+                         user_msg("hello")],
+                        session_id="s1")
+            html = cd._index_page(cd.load_sessions(d))
+            self.assertIn("kebab-search-target", html)
 
     def test_malformed_lines_are_skipped(self):
         with tempfile.TemporaryDirectory() as d:

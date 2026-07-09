@@ -44,6 +44,29 @@ class TestMarkdownCorrectness(unittest.TestCase):
         out = R("1. one\n2. two")
         self.assertIn("<ol>", out)
 
+    def test_nested_unordered_list(self):
+        out = R("- parent\n  - child one\n  - child two\n- second parent")
+        self.assertEqual(out.count("<ul>"), 2)   # outer + one nested
+        self.assertIn("child one", out)
+        self.assertIn("second parent", out)
+
+    def test_ordered_nested_in_unordered(self):
+        out = R("- parent\n  1. first\n  2. second")
+        self.assertIn("<ul>", out)
+        self.assertIn("<ol>", out)
+
+    def test_two_level_nesting_closes_back_out(self):
+        out = R("- a\n  - b\n    - c\n- d")
+        self.assertEqual(out.count("<ul>"), 3)
+        self.assertEqual(out.count("</ul>"), 3)
+
+    def test_task_list_checkboxes(self):
+        out = R("- [ ] open item\n- [x] done item")
+        self.assertIn("☐", out)
+        self.assertIn("☑", out)
+        self.assertNotIn("[ ]", out)
+        self.assertNotIn("[x]", out)
+
     def test_table(self):
         out = R("| a | b |\n| - | - |\n| 1 | 2 |")
         self.assertIn("<table>", out)
@@ -90,6 +113,8 @@ PATHOLOGICAL = [
     "> ```\n> code in quote\n> ```",
     "- " * 2000,
     "-\n" * 1000,
+    "".join("  " * i + "- deep\n" for i in range(200)),   # runaway nesting
+    "- a\n        - jump\n- back\n  1. mixed\n- [ ] \n- [x]x",  # ragged indents/checkboxes
     "\n" * 1000,
     "*" * 5000,
     "_" * 5000,
