@@ -10,3 +10,6 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# Personal real-world checklist (global rule: never tracked)
+TODO.md
