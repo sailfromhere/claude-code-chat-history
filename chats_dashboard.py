@@ -51,6 +51,7 @@ PROJECT_ALIASES = {
 MAX_BLOCK_CHARS = 8000
 MAX_RESULT_LINES = 40   # cap tool-result height (even when tools are shown)
 MAX_DIFF_LINES = 60     # cap Edit/Write diff height
+MAX_IMAGE_B64 = 2_000_000  # base64 chars (~1.5 MB binary); bigger pastes get a placeholder
 SNIPPET_CHARS = 200
 TITLE_FALLBACK_CHARS = 70
 ACTIVE_WINDOW_MIN = 15  # a session is "active" if its last activity is within this many minutes
@@ -210,7 +211,8 @@ def _compute_metadata(s: Session) -> None:
                 if first_command is None:
                     first_command = _command_label(e)
             continue
-        if _is_meta(e) or _is_tool_result_only(e) or e.get("uuid") in expansions:
+        if (_is_meta(e) or _is_tool_result_only(e) or _is_interrupt(e)
+                or _is_compact_summary(e) or e.get("uuid") in expansions):
             continue
         if s.n_user == 0:  # the first real prompt = what initiated the session
             s.initiated_by_sdk = _prompt_submitted_by(e) == "sdk"
@@ -324,6 +326,25 @@ def _prompt_submitted_by(entry: dict) -> str:
     return ""
 
 
+# The user entry written when the human presses Esc mid-turn. Its content is
+# exactly one of these strings (verified on real data 2026-07-09) — a human
+# message merely QUOTING one has surrounding prose, so it won't exact-match.
+_INTERRUPT_SENTINELS = {
+    "[Request interrupted by user]",
+    "[Request interrupted by user for tool use]",
+}
+
+
+def _is_interrupt(entry: dict) -> bool:
+    return _plain_user_text(entry).strip() in _INTERRUPT_SENTINELS
+
+
+def _is_compact_summary(entry: dict) -> bool:
+    """The continuation-summary user entry /compact writes ("This session is
+    being continued…"). isMeta is ABSENT on it, so the meta rule can't catch it."""
+    return entry.get("isCompactSummary") is True
+
+
 # Synthetic assistant turns the harness records when no model reply is needed
 # (e.g. right after /exit or at a resume seam). Not real content.
 _ASSISTANT_SENTINELS = {"No response requested."}
@@ -433,6 +454,40 @@ def _render_meta(entry: dict) -> str:
             f'<div class="sys-body">{body}</div></details>')
 
 
+def _render_interrupt(entry: dict) -> str:
+    """Esc interrupt — a status marker (the CLI shows 'Interrupted'), not speech."""
+    tool = "for tool use" in _plain_user_text(entry)
+    label = "Interrupted by user" + (" (during tool use)" if tool else "")
+    return f'<div class="interrupt">⏹ {label}</div>'
+
+
+def _render_compact_summary(entry: dict) -> str:
+    """Collapsed divider chip for the /compact continuation summary."""
+    body = _esc(_clip(_cap_lines(_plain_user_text(entry).strip())))
+    return ('<details class="sys-event"><summary><span class="sys-icon">🗜</span> '
+            'conversation compacted — continuation summary</summary>'
+            f'<div class="sys-body">{body}</div></details>')
+
+
+def _render_image(block: dict) -> str:
+    """Inline a pasted image (the .jsonl already stores it as base64)."""
+    src = block.get("source")
+    if not isinstance(src, dict):
+        src = {}
+    data = src.get("data")
+    if not isinstance(data, str) or not data or src.get("type") != "base64":
+        return ('<div class="sys-event"><span class="sys-icon">🖼</span> '
+                'image (unsupported source)</div>')
+    if len(data) > MAX_IMAGE_B64:
+        kb = len(data) * 3 // 4 // 1024
+        return (f'<div class="sys-event"><span class="sys-icon">🖼</span> pasted image '
+                f'({kb:,} KB — too large to embed; the original .jsonl has it)</div>')
+    media = _esc(src.get("media_type") or "image/png")
+    return (f'<img class="msg-img" src="data:{media};base64,{_esc(data)}" '
+            f'alt="pasted image" loading="lazy" '
+            f'onclick="this.classList.toggle(\'expanded\')">')
+
+
 def _expansion_uuids(entries: list[dict]) -> set[str]:
     """
     A slash command stores two entries: the <command-name> marker, then a
@@ -445,8 +500,12 @@ def _expansion_uuids(entries: list[dict]) -> set[str]:
         if (e.get("message") or {}).get("role") != "user" or not _is_slash_command(e):
             continue
         nxt = entries[i + 1] if i + 1 < len(entries) else None
+        # A manual /compact's continuation summary (and an Esc interrupt) can
+        # directly follow the command entry — neither is the command's prompt
+        # expansion; leave them to their own renderers.
         if (nxt and (nxt.get("message") or {}).get("role") == "user"
                 and not _is_noise(nxt) and not _is_tool_result_only(nxt)
+                and not _is_compact_summary(nxt) and not _is_interrupt(nxt)
                 and _plain_user_text(nxt).strip()):
             uid = nxt.get("uuid")
             if uid:
@@ -848,6 +907,14 @@ def _render_turns(s: Session) -> list[Turn]:
             if e.get("uuid") in expansions:
                 i += 1
                 continue  # boilerplate already folded under its command
+            if _is_interrupt(e):
+                turns.append(Turn("command", ts, _render_interrupt(e)))
+                i += 1
+                continue
+            if _is_compact_summary(e):
+                turns.append(Turn("command", ts, _render_compact_summary(e)))
+                i += 1
+                continue
             if _is_meta(e) and not _is_noise(e):
                 # Freeform injected content (skill bodies, etc.) — one collapsed chip.
                 # Skip the command/bash/tag pipeline; its body isn't wrapper machinery.
@@ -893,8 +960,9 @@ def _render_turns(s: Session) -> list[Turn]:
 
 
 def _has_visible_nontool(entry: dict) -> bool:
-    """Does the entry render anything that survives 'hide tool calls'? (text, an
-    AskUserQuestion card, or a plan card — all stay visible; plain tool_use/result don't.)"""
+    """Does the entry render anything that survives 'hide tool calls'? (text, a pasted
+    image, an AskUserQuestion card, or a plan card — all stay visible; plain
+    tool_use/result don't.)"""
     c = _content(entry)
     if isinstance(c, str):
         return bool(c.strip())
@@ -903,6 +971,8 @@ def _has_visible_nontool(entry: dict) -> bool:
             if not isinstance(b, dict):
                 continue
             if b.get("type") == "text" and b.get("text", "").strip():
+                return True
+            if b.get("type") == "image":
                 return True
             if b.get("type") == "tool_use":
                 name = b.get("name", "")
@@ -944,6 +1014,8 @@ def _render_user_blocks(entry: dict, results: dict, consumed: set) -> str:
             t = b.get("type")
             if t == "text":
                 out.append(_render_text_body(b.get("text", "")))
+            elif t == "image":
+                out.append(_render_image(b))
             elif t == "tool_result":
                 # Orphan results only; matched ones render under their tool_use.
                 tid = b.get("tool_use_id")
@@ -1322,6 +1394,12 @@ def _session_markdown(s: Session) -> str:
         if role == "user":
             if e.get("uuid") in expansions:
                 continue  # command boilerplate, not human text
+            if _is_interrupt(e):
+                lines.append("> ⏹ interrupted by user\n")
+                continue
+            if _is_compact_summary(e):
+                lines.append("> 🗜 conversation compacted (continuation summary)\n")
+                continue
             if _is_meta(e) and not _is_noise(e):
                 m = re.match(r"Base directory for this skill:\s*(\S+)", _plain_user_text(e).strip())
                 if m:
@@ -1352,6 +1430,12 @@ def _session_markdown(s: Session) -> str:
             if _is_tool_result_only(e):
                 continue  # tool results belong with Claude's call, below
             txt = _plain_user_text(e).strip()
+            c = _content(e)
+            n_img = (sum(1 for b in c if isinstance(b, dict) and b.get("type") == "image")
+                     if isinstance(c, list) else 0)
+            if n_img:
+                note = f"*[{n_img} pasted image{'s' if n_img > 1 else ''}]*"
+                txt = f"{txt}\n{note}".strip()
             if txt:
                 lines.append(f"**You:** {txt}\n")
         elif role == "assistant":
@@ -1492,6 +1576,13 @@ padding:6px 10px;margin:4px 0;border-left:2px solid var(--line)}
 @media (prefers-color-scheme:dark){.sys-event.error{color:#f85149}}
 .sys-event summary{cursor:pointer}
 .sys-icon{opacity:.7}
+/* Esc interrupt — a status marker row, not user speech */
+.interrupt{color:#cf222e;font-size:12.5px;font-weight:600;padding:2px 0}
+@media (prefers-color-scheme:dark){.interrupt{color:#f85149}}
+/* pasted images (base64-embedded from the .jsonl); click toggles full size */
+.msg-img{display:block;max-width:100%;max-height:340px;width:auto;
+border:1px solid var(--line);border-radius:8px;margin:8px 0;cursor:zoom-in}
+.msg-img.expanded{max-height:none;cursor:zoom-out}
 #tip{position:fixed;z-index:1000;max-width:440px;background:var(--ink);color:var(--bg);
 font-size:12px;line-height:1.45;padding:7px 10px;border-radius:7px;pointer-events:none;
 box-shadow:0 4px 16px rgba(0,0,0,.3);white-space:normal}
@@ -1708,6 +1799,7 @@ def _condense_transcript(s: Session) -> str:
         role = (e.get("message") or {}).get("role")
         if role == "user":
             if (_is_noise(e) or _is_meta(e) or _is_tool_result_only(e)
+                    or _is_interrupt(e) or _is_compact_summary(e)
                     or e.get("uuid") in expansions):
                 continue
             txt = _plain_user_text(e).strip()

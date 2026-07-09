@@ -106,6 +106,31 @@ def bash_io(cmd: str, stdout: str = "", stderr: str = "") -> dict:
     return _entry("user", body)
 
 
+def interrupt_entry(tool_use: bool = False) -> dict:
+    """The user entry the harness writes when the human presses Esc mid-turn.
+    Real shape (verified 2026-07-09): a list with ONE text block whose text is
+    exactly the sentinel — never mixed with other blocks."""
+    text = ("[Request interrupted by user for tool use]" if tool_use
+            else "[Request interrupted by user]")
+    return _entry("user", [{"type": "text", "text": text}])
+
+
+def compact_summary_entry(summary: str = (
+        "This session is being continued from a previous conversation that ran "
+        "out of context. The summary below covers the earlier portion.")) -> dict:
+    """The continuation-summary user entry written after /compact. Marked by
+    isCompactSummary (isMeta is ABSENT on it, so the meta rule can't catch it)."""
+    e = _entry("user", summary)
+    e["isCompactSummary"] = True
+    e["isVisibleInTranscriptOnly"] = True
+    return e
+
+
+def image_block(data: str = "iVBORw0KGgoAAAANSUhEUgFAKE", media: str = "image/png") -> dict:
+    """A pasted-image content block (base64, exactly as Claude Code records it)."""
+    return {"type": "image", "source": {"type": "base64", "media_type": media, "data": data}}
+
+
 def tool_result_entry(tool_use_id: str, content, is_error: bool = False) -> dict:
     """A user entry whose only content is a tool_result (the harness's reply)."""
     block = {"type": "tool_result", "tool_use_id": tool_use_id, "content": content}
