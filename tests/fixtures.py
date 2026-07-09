@@ -171,6 +171,13 @@ def ai_title_line(session_id: str, title: str) -> dict:
     return {"type": "ai-title", "sessionId": session_id, "aiTitle": title}
 
 
+def turn_duration_line(parent_uuid: str, ms: int, session_id: str = "s1") -> dict:
+    """A system/turn_duration line — parentUuid always points at the turn's
+    final ASSISTANT entry (verified 2026-07-09, 1028/1028)."""
+    return {"type": "system", "subtype": "turn_duration", "durationMs": ms,
+            "parentUuid": parent_uuid, "sessionId": session_id}
+
+
 def agent_name_line(session_id: str, name: str) -> dict:
     """An agent-name JSONL line — the harness-assigned session display name
     (kebab-case, e.g. 'fix-sticky-header-gap'). Marks its OWN session; a session

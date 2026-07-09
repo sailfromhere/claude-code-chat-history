@@ -9,6 +9,31 @@ Status values: `TBD` | `Decided: <summary>` | `Built`
 
 ---
 
+## Codebase review — 2026-07-09 (all TBD unless noted)
+
+Fidelity gaps verified against real `~/.claude/projects` data (counts as of 2026-07-09):
+
+- **P1 — Interrupts render as user speech.** `Built (2026-07-09):` exact-sentinel match (`_is_interrupt`) → red `⏹ Interrupted by user` status row (`(during tool use)` variant); excluded from n_user/snippet/titler; human prose *quoting* the sentinel stays visible (exact-match guard). Verified on real data: 15 markers, 0 left in user bubbles.
+- **P1 — Compact summary renders as a "You" bubble.** `Built (2026-07-09):` `isCompactSummary` → collapsed `🗜 conversation compacted — continuation summary` chip; excluded from n_user/snippet/titler. **Real-data catch:** a manual /compact's summary directly follows the `⌘ /compact` command entry, so `_expansion_uuids` was folding it as the command's "expanded prompt" — compact/interrupt entries are now excluded from expansion-claiming (regression tests for both). `system/compact_boundary` metadata (trigger, preTokens) still unrendered — fold into the chip if system-line ingestion ever lands.
+- **P1 — Pasted images silently dropped.** `Built (2026-07-09):` `image` blocks embed as `<img src="data:…;base64,…">` (max-height 340px, click-to-toggle full size, lazy-loaded, `_esc` on media/data), capped at `MAX_IMAGE_B64` (2M b64 chars ≈1.5MB) → placeholder chip above; malformed source/data → placeholder, never a crash (adversarial-review finding: unguarded types would have aborted the whole generation). Counts as visible content for the Tools toggle. 63 images embed on real data.
+- **P2 — `agent-name` entries ignored.** `Built (2026-07-09):` ingested in `load_sessions` (last per session wins **by file mtime** — the lines carry no timestamp, so glob order was nondeterministic across resumed files; adversarial-review finding); title fallback between ai_title and snippet (truncated to `TITLE_FALLBACK_CHARS`, second review finding); added to the card's `data-search` haystack so the harness name is searchable even when an LLM title displays. Card chip not built (visual call, revisit if wanted).
+- **P2 — TodoWrite renders as a JSON chip.** `Superseded (2026-07-09):` **zero** TodoWrite calls in the entire corpus — the CLI moved to TaskCreate/TaskUpdate. Those get readable chip summaries instead (`subject`, `#id → status`); a stateful checklist card reconstruction from TaskUpdate deltas is not worth it.
+- **P2 — Plan card doesn't show approval outcome.** `Built (2026-07-09):` `_plan_outcomes` pairs each plan-file Write with the next ExitPlanMode's tool_result (verified shapes: 96× "User has approved your plan", 3× is_error rejection) → `✓ approved` / `✗ rejected` badge on the plan-card header. No result → no badge. Multiple plans per session pair independently (cross-pairing test).
+- **P2 — `_tool_summary` misses newer tools.** `Built (2026-07-09):` key list gained `skill`/`subject`/`description` (before `prompt`, so Agent chips show the description, Bash still shows its command); TaskUpdate special-cased to `#id → status`.
+- **P3 — Per-turn model + duration.** `Built (2026-07-09), user picked from a rendered mockup:` **model → a divider row on switch** (mockup C; buffered so an invisible switching entry — empty thinking block — never strands a divider; 30 dividers on real data) and **durations on every turn** (mockup D-all): `system/turn_duration` lines ingested (`parentUuid` → the turn's final assistant entry, verified 1028/1028) → `⏱ 2m 41s` in the turn timestamp; duration count+sum folded into the render fingerprint since those lines change neither entry count nor last_ts. Third adversarial review found + fixed: `_ptext` memo key was poisonable from crafted jsonl (now stripped at the load boundary), prune could delete files the generator never created (now scoped to previous-manifest entries only, with a path-part guard).
+- **P3 — Watch item:** newer CLIs also log slash commands as `system/local_command` lines (dashboard skips `system`). Harmless duplicate today; if a future CLI drops the user-role copy, commands vanish from transcripts.
+- **Closable: thinking-block visibility (P2 item below).** All 7,599 thinking blocks in real data have an EMPTY `thinking` field (signature only) — there is nothing to render. Optionally a "✻ thought" marker; otherwise close.
+
+Code health / perf (defer perf until measured — full run is ~0.2s):
+
+- **P2 — Markdown: nested lists flatten.** `Built (2026-07-09):` `_render_list` renders consecutive items with an indent stack (deeper → nested `<ul>`/`<ol>` as a sibling of the previous `<li>` — deliberate simplicity, browsers render it nested); `- [ ]`/`- [x]` → ☐/☑ `li.task`. Bounded by construction (pops ≤ pushes); two new pathological corpus entries (200-deep nesting, ragged indents). Multi-line list items still unhandled (they end the list — acceptable).
+- **P2 — `_atomic_write_json` tmp path isn't pid-suffixed.** `Built (2026-07-09):` delegates to `_atomic_write_text`.
+- **P3 — PRICING prefix-match fallback.** `Built (2026-07-09):` `_price_for` — exact match, else dash-boundary prefix (`claude-haiku-4-5-20251001` prices as haiku; `claude-sonnet-55` does NOT match sonnet-5 — test).
+- **P3 — Repeated re-parsing.** `Built (2026-07-09):` `_plain_user_text` memoized on the entry dict (`_ptext` key); `_expansion_uuids`/`_result_map` cached per Session (`_session_expansions`/`_session_results` — safe because entries are immutable after load). Load 1.52s→1.29s, md render 0.29s→0.22s on 141 sessions / 72k lines.
+- **P3 — `write_site` rewrites everything every run.** `Built (2026-07-09):` incremental rendering via `.render-manifest.json` — per-session fingerprint over (entry count, first/last ts, title, summary, project_path, generator-source+TZ hash); skip render+write on match, self-heal missing files, prune orphan pages of deleted sessions, index always rewritten last. **Steady state 3.1s → 1.27s** (all remaining time is json parsing). The live session's fingerprint changes every run so it always re-renders — correct, and only 1 page. Mutation-verified tests in `tests/test_writesite.py`.
+- **Measured & REJECTED (2026-07-09, don't re-try): substring pre-filter before `json.loads`** (skip lines whose type we ignore): 0.86s vs 0.79s baseline — the per-line needle scans cost more than the skipped parses. Parsing is at its practical floor; the next step would be a file-level parsed-entry cache (pickle), rejected for staleness/complexity.
+- **Housekeeping (user decision): `TODO.md` is git-tracked in the public repo**, contra the global gitignore rule. Untrack (`git rm --cached`) + add to .gitignore — needs user OK since the repo is public (already published in history).
+
 ## Log — 2026-07-01
 
 - **Pricing table refresh** — `Built:` added `claude-fable-5` / `claude-mythos-5` ($10/$50 per MTok) and `claude-sonnet-5` ($3/$15, standard rate — not the temporary $2/$10 intro) to `PRICING` in `chats_dashboard.py`. Sonnet 5 and Fable/Mythos sessions were previously counted as unpriced (shown with the `+` incomplete-cost marker).
@@ -317,7 +342,8 @@ Chat history can contain sensitive data (API keys in tool outputs, private code)
 ### Thinking block visibility
 Encrypted currently, but architecture may change.
 - **Options:** Always hide, or expose as `--include-thinking` flag for future use
-- **Status:** TBD
+- **Status:** Closed (2026-07-09) — verified all 7,599 thinking blocks in real data have an
+  EMPTY `thinking` field (signature only); there is nothing to render, now or retroactively.
 
 ### Cross-platform support
 `~/.claude` and `~/Downloads` are macOS/Linux paths. Windows uses different conventions.

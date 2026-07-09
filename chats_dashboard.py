@@ -99,6 +99,7 @@ class Turn:
     html: str          # rendered inner HTML
     tools_only: bool = False  # turn has only tool I/O → hide whole row when tools hidden
     submitted: str = ""  # provenance of a "user" turn: "sdk" if Claude/a tool sent it (not typed)
+    dur: str = ""      # formatted turn duration ("2m 41s"), from system/turn_duration
 
 
 @dataclass
@@ -108,6 +109,7 @@ class Session:
     entries: list[dict] = field(default_factory=list)  # raw user/assistant entries
     ai_title: str | None = None
     agent_name: str = ""  # harness-assigned session display name (last agent-name line)
+    turn_durations: dict = field(default_factory=dict)  # assistant uuid → durationMs
 
     # computed
     first_ts: str = ""
@@ -127,6 +129,10 @@ class Session:
     cost_usd: float = 0.0
     cost_complete: bool = True  # False if any model's price is unknown
 
+    # per-session render caches (entries are immutable after load)
+    _expansions: set | None = field(default=None, repr=False, compare=False)
+    _results: dict | None = field(default=None, repr=False, compare=False)
+
     @property
     def project_name(self) -> str:
         path = self.project_path.rstrip("/")
@@ -142,6 +148,7 @@ def load_sessions(projects_dir: str) -> list[Session]:
     sessions: dict[str, Session] = {}
     titles: dict[str, str] = {}
     agent_names: dict[str, str] = {}
+    durations: dict[str, dict] = {}
 
     def _mtime(p: str) -> float:
         try:
@@ -162,6 +169,14 @@ def load_sessions(projects_dir: str) -> list[Session]:
                 if sid and t:
                     titles[sid] = t
                 continue
+            if etype == "system":
+                # turn_duration lines: parentUuid points at the turn's final
+                # assistant entry (verified 2026-07-09). Other system lines skipped.
+                if (line.get("subtype") == "turn_duration"
+                        and line.get("sessionId") and line.get("parentUuid")):
+                    durations.setdefault(line["sessionId"], {})[line["parentUuid"]] = \
+                        line.get("durationMs")
+                continue
             if etype == "agent-name":
                 # Harness-assigned display name for its OWN session (the name the
                 # Claude Code UI shows). Renames accrue; the last one is current.
@@ -180,6 +195,10 @@ def load_sessions(projects_dir: str) -> list[Session]:
                 s = sessions[sid] = Session(session_id=sid)
             if not s.project_path and line.get("cwd"):
                 s.project_path = line["cwd"]
+            # "_ptext" is OUR memo slot on the entry dict; a crafted jsonl line
+            # pre-seeding it could poison the interrupt/noise classifiers (they
+            # trust the cache) and hide the real content. Strip at the boundary.
+            line.pop("_ptext", None)
             s.entries.append(line)
 
     result: list[Session] = []
@@ -189,6 +208,7 @@ def load_sessions(projects_dir: str) -> list[Session]:
         s.entries.sort(key=lambda e: e.get("timestamp") or "")
         s.ai_title = titles.get(sid)
         s.agent_name = agent_names.get(sid, "")
+        s.turn_durations = durations.get(sid, {})
         _compute_metadata(s)
         result.append(s)
 
@@ -217,7 +237,7 @@ def _compute_metadata(s: Session) -> None:
     if timestamps:
         s.first_ts, s.last_ts = timestamps[0], timestamps[-1]
 
-    expansions = _expansion_uuids(s.entries)
+    expansions = _session_expansions(s)
     first_command: str | None = None
 
     for e in s.entries:
@@ -552,6 +572,20 @@ def _expansion_uuids(entries: list[dict]) -> set[str]:
     return out
 
 
+def _session_expansions(s: "Session") -> set:
+    """Cached _expansion_uuids — metadata, HTML, markdown, and the titler all need it."""
+    if s._expansions is None:
+        s._expansions = _expansion_uuids(s.entries)
+    return s._expansions
+
+
+def _session_results(s: "Session") -> dict:
+    """Cached _result_map (HTML + markdown renders)."""
+    if s._results is None:
+        s._results = _result_map(s.entries)
+    return s._results
+
+
 def _result_map(entries: list[dict]) -> dict[str, dict]:
     """Map tool_use_id → tool_result block, so results pair with their call."""
     out: dict[str, dict] = {}
@@ -582,15 +616,23 @@ def _strip_ansi(text: str) -> str:
 
 
 def _plain_user_text(entry: dict) -> str:
-    """Human-typed text from a user entry (string content or text blocks)."""
+    """Human-typed text from a user entry (string content or text blocks).
+    Memoized on the entry dict — the noise/command/interrupt predicates each
+    call this, so it runs many times per entry across metadata + rendering."""
+    cached = entry.get("_ptext")
+    if cached is not None:
+        return cached
     c = _content(entry)
     if isinstance(c, str):
-        return _strip_ansi(c)
-    if isinstance(c, list):
+        text = _strip_ansi(c)
+    elif isinstance(c, list):
         parts = [b.get("text", "") for b in c
                  if isinstance(b, dict) and b.get("type") == "text"]
-        return _strip_ansi("\n".join(p for p in parts if p))
-    return ""
+        text = _strip_ansi("\n".join(p for p in parts if p))
+    else:
+        text = ""
+    entry["_ptext"] = text
+    return text
 
 
 def _tool_result_text(content) -> str:
@@ -1002,13 +1044,15 @@ def _cap_lines(text: str, n: int = MAX_RESULT_LINES) -> str:
 
 
 def _render_turns(s: Session) -> list[Turn]:
-    results = _result_map(s.entries)
+    results = _session_results(s)
     consumed: set[str] = set()  # tool_use_ids already shown under their call
-    expansions = _expansion_uuids(s.entries)
+    expansions = _session_expansions(s)
     plan_outcomes = _plan_outcomes(s.entries, results)
     entries = s.entries
 
     turns: list[Turn] = []
+    cur_model: str | None = None  # last real model seen, for the switch divider
+    pending_divider: tuple[str, str] | None = None
     i, n = 0, len(entries)
     while i < n:
         e = entries[i]
@@ -1063,9 +1107,26 @@ def _render_turns(s: Session) -> list[Turn]:
             if _is_sentinel_assistant(e):
                 i += 1
                 continue
+            # Model-switch divider (user choice: divider row, not per-turn chips).
+            # Buffered: emitted only when a VISIBLE assistant turn follows, so an
+            # invisible switching entry (empty thinking block, tools-only) never
+            # strands a divider next to nothing.
+            model = (e.get("message") or {}).get("model")
+            if isinstance(model, str) and model and model != "<synthetic>":
+                if cur_model is not None and model != cur_model:
+                    label = model.removeprefix("claude-")
+                    pending_divider = (ts,
+                                       f'<div class="model-divider">model → {_esc(label)}</div>')
+                cur_model = model
             inner = _render_assistant_blocks(e, results, consumed, plan_outcomes)
             if inner.strip():
-                turns.append(Turn("assistant", ts, inner, tools_only=not _has_visible_nontool(e)))
+                if pending_divider:
+                    turns.append(Turn("command", *pending_divider))
+                    pending_divider = None
+                turns.append(Turn("assistant", ts, inner,
+                                  tools_only=not _has_visible_nontool(e),
+                                  dur=_fmt_dur(s.turn_durations.get(e.get("uuid")))
+                                  if e.get("uuid") in s.turn_durations else ""))
         i += 1
     return turns
 
@@ -1205,6 +1266,23 @@ def _active_label(ts: str) -> str:
     return f"active {int(m)}m ago"
 
 
+def _fmt_dur(ms) -> str:
+    """Compact human duration from milliseconds: 45s · 2m 41s · 1h 5m."""
+    try:
+        sec = int(round(float(ms) / 1000))
+    except (TypeError, ValueError, OverflowError):  # Overflow: json accepts Infinity
+        return ""
+    if sec < 1:
+        return "<1s"
+    if sec < 60:
+        return f"{sec}s"
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m"
+
+
 def _fmt_tokens(n: int) -> str:
     if n >= 1_000_000:
         return f"{n / 1_000_000:.1f}M"
@@ -1258,19 +1336,94 @@ def _atomic_write_text(path: str, content: str) -> None:
     os.replace(tmp, path)
 
 
-def write_site(sessions: list[Session], output_dir: str) -> None:
+RENDER_MANIFEST = ".render-manifest.json"
+_GEN_HASH: str | None = None
+
+
+def _generator_hash() -> str:
+    """Fingerprint of the generator itself (source bytes + timezone) — baked into
+    every page fingerprint so a code/TZ change rewrites everything."""
+    global _GEN_HASH
+    if _GEN_HASH is None:
+        tz = datetime.now().astimezone().strftime("%z")
+        try:
+            with open(os.path.abspath(__file__), "rb") as fh:
+                _GEN_HASH = hashlib.sha1(fh.read() + tz.encode()).hexdigest()
+        except OSError:
+            _GEN_HASH = f"unknown-{os.getpid()}"  # can't read self → never skip
+    return _GEN_HASH
+
+
+def _session_render_fp(s: Session) -> str:
+    """Cheap proxy for everything a session's page/.md depends on. The .jsonl is
+    append-only, so (entry count, first/last ts) tracks content; title/summary
+    track the LLM titler; project_path tracks aliases; the generator hash tracks
+    code/CSS/JS changes."""
+    # turn_durations included explicitly: a duration line can land AFTER the
+    # session's final assistant entry, changing neither entry count nor last_ts.
+    dur_sig = f"{len(s.turn_durations)}:{sum(v or 0 for v in s.turn_durations.values())}"
+    key = "|".join([str(len(s.entries)), s.first_ts, s.last_ts, s.title,
+                    s.summary, s.project_path, dur_sig, _generator_hash()])
+    return hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()
+
+
+def write_site(sessions: list[Session], output_dir: str) -> tuple[int, int, int]:
+    """Render the site incrementally: only sessions whose fingerprint changed (or
+    whose files are missing) are re-rendered; pages of deleted sessions are
+    pruned. Returns (written, skipped, pruned)."""
     sessions_dir = os.path.join(output_dir, "sessions")
     os.makedirs(sessions_dir, exist_ok=True)
     _write_assets(output_dir)
 
-    for s in sessions:
-        _atomic_write_text(os.path.join(sessions_dir, f"{s.session_id}.html"),
-                           _session_page(s))
-        _atomic_write_text(os.path.join(sessions_dir, f"{s.session_id}.md"),
-                           _session_markdown(s))
+    manifest_path = os.path.join(output_dir, RENDER_MANIFEST)
+    manifest: dict = {}
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, encoding="utf-8") as fh:
+                manifest = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+    if not isinstance(manifest, dict):
+        manifest = {}
 
+    new_manifest: dict = {}
+    written = skipped = 0
+    for s in sessions:
+        fp = _session_render_fp(s)
+        html_path = os.path.join(sessions_dir, f"{s.session_id}.html")
+        md_path = os.path.join(sessions_dir, f"{s.session_id}.md")
+        if (manifest.get(s.session_id) == fp
+                and os.path.isfile(html_path) and os.path.isfile(md_path)):
+            new_manifest[s.session_id] = fp
+            skipped += 1
+            continue
+        _atomic_write_text(html_path, _session_page(s))
+        _atomic_write_text(md_path, _session_markdown(s))
+        new_manifest[s.session_id] = fp
+        written += 1
+
+    # Prune pages of sessions that no longer exist — but ONLY files this
+    # generator created (present in the previous manifest). --output-dir can
+    # point anywhere; never delete files we didn't write.
+    current = {s.session_id for s in sessions}
+    pruned = 0
+    for sid in manifest:
+        if sid in current:
+            continue
+        for ext in ("html", "md"):
+            fn = f"{sid}.{ext}"
+            if os.path.basename(fn) != fn:  # manifest poisoning guard: no path parts
+                continue
+            try:
+                os.remove(os.path.join(sessions_dir, fn))
+                pruned += 1
+            except OSError:
+                pass
+
+    _atomic_write_json(manifest_path, new_manifest)
     # Write index last (atomically) so it never references a half-written page.
     _atomic_write_text(os.path.join(output_dir, "index.html"), _index_page(sessions))
+    return written, skipped, pruned
 
 
 def _write_assets(output_dir: str) -> None:
@@ -1419,9 +1572,10 @@ def _session_page(s: Session) -> str:
             badge = ('<span class="who-badge" data-tip="Submitted programmatically by '
                      'Claude or a tool (a headless claude -p subprocess), not typed by you">'
                      '⚙ submitted</span>')
+        dur = f'<span class="dur">{_esc(t.dur)}</span>' if t.dur else ""
         rows.append(
             f'<div class="row {t.role}{extra}">'
-            f'<div class="who">{who}{badge}<span class="ts">{_esc(_fmt(t.ts))}</span></div>'
+            f'<div class="who">{who}{badge}<span class="ts">{_esc(_fmt(t.ts))}{dur}</span></div>'
             f'<div class="bubble">{t.html}</div></div>'
         )
 
@@ -1498,8 +1652,8 @@ function toggleTools(on){{
 
 def _session_markdown(s: Session) -> str:
     """Plain-markdown export bundled into the page for the Export button."""
-    results = _result_map(s.entries)
-    expansions = _expansion_uuids(s.entries)
+    results = _session_results(s)
+    expansions = _session_expansions(s)
     lines = [f"# {s.title}", "", f"_{s.project_name} · {_fmt(s.first_ts)} → {_fmt(s.last_ts)}_", ""]
     for e in s.entries:
         role = (e.get("message") or {}).get("role")
@@ -1691,6 +1845,12 @@ padding:6px 10px;margin:4px 0;border-left:2px solid var(--line)}
 /* Esc interrupt — a status marker row, not user speech */
 .interrupt{color:#cf222e;font-size:12.5px;font-weight:600;padding:2px 0}
 @media (prefers-color-scheme:dark){.interrupt{color:#f85149}}
+/* model-switch divider (user choice 2026-07-09: divider row, not per-turn chips) */
+.model-divider{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:11px;margin:16px 0}
+.model-divider::before,.model-divider::after{content:"";flex:1;border-top:1px solid var(--line)}
+/* turn duration in the timestamp (from system/turn_duration lines) */
+.dur{color:var(--muted);font-weight:400;margin-left:8px;font-size:11px}
+.dur::before{content:"⏱ ";opacity:.7}
 /* pasted images (base64-embedded from the .jsonl); click toggles full size */
 .msg-img{display:block;max-width:100%;max-height:340px;width:auto;
 border:1px solid var(--line);border-radius:8px;margin:8px 0;cursor:zoom-in}
@@ -1911,7 +2071,7 @@ updateHeaders();  // populate date-group tallies on first load (all cards visibl
 def _condense_transcript(s: Session) -> str:
     """A compact human/Claude text view for the titler (tool noise dropped)."""
     parts: list[str] = []
-    expansions = _expansion_uuids(s.entries)
+    expansions = _session_expansions(s)
     for e in s.entries:
         role = (e.get("message") or {}).get("role")
         if role == "user":
@@ -2082,8 +2242,11 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_titles:
         cache, cache_path, todo = resolve_cached_titles(sessions, args.output_dir)
 
-    write_site(sessions, args.output_dir)
-    print(f"Dashboard written to {index}")
+    written, skipped, pruned = write_site(sessions, args.output_dir)
+    stats = f"{written} page(s) rendered, {skipped} unchanged"
+    if pruned:
+        stats += f", {pruned} stale file(s) pruned"
+    print(f"Dashboard written to {index} ({stats})")
     if args.open:
         open_in_browser(index)
 

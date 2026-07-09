@@ -172,6 +172,29 @@ class TestAttribution(unittest.TestCase):
         self.assertIn("Interrupted by user", chips)
         self.assertNotIn("expanded command prompt", chips)
 
+    def test_crafted_ptext_field_cannot_poison_classification(self):
+        # The _plain_user_text memo key ("_ptext") lives in the entry dict, whose
+        # keys come from UNTRUSTED jsonl. A crafted line pre-seeding "_ptext" with
+        # an interrupt sentinel must not hide the real content or flip the
+        # interrupt/noise classifiers — load_sessions strips it.
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            import os
+            proj = os.path.join(d, "proj")
+            os.makedirs(proj)
+            line = {"type": "user", "uuid": "p1", "timestamp": "2026-06-01T12:00:00",
+                    "sessionId": "s1", "cwd": "/x/p",
+                    "_ptext": "[Request interrupted by user]",
+                    "message": {"role": "user", "content": "THE REAL MESSAGE"}}
+            with open(os.path.join(proj, "a.jsonl"), "w") as fh:
+                fh.write(_json.dumps(line) + "\n")
+            s = cd.load_sessions(d)[0]
+            users = turns_by_role(s, "user")
+            self.assertEqual(len(users), 1, "poisoned entry hidden as an interrupt")
+            self.assertIn("THE REAL MESSAGE", users[0].html)
+            self.assertIn("THE REAL MESSAGE", s.snippet)
+
     # --- compact summaries (2026-07-09) -------------------------------------- #
     def test_compact_summary_renders_as_chip_not_user(self):
         s = make_session([
