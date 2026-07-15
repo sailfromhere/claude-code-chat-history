@@ -9,6 +9,65 @@ Status values: `TBD` | `Decided: <summary>` | `Built`
 
 ---
 
+## Log — 2026-07-14 — dashboard becomes a durable, browsable archive
+
+**Trigger:** user noticed chats older than ~30 days were missing from the dashboard. Root cause was
+two-layered: (1) Claude Code's own `cleanupPeriodDays` (default 30, unset in this user's
+`~/.claude/settings.json`) deletes source `.jsonl` under `~/.claude/projects/` — verified: oldest
+local file was exactly ~30 days old, `find -mtime +30` returned zero; (2) `write_site()` mirrored
+that: it `os.remove`d a session's rendered `sessions/<id>.{html,md}` the moment its source
+disappeared. No local recovery path existed (no Time Machine destination configured on this
+machine) — this only fixes retention *going forward*.
+
+- **P1 — Stop pruning by default; make it opt-in.** `Built:` `write_site(sessions, output_dir,
+  prune_orphans: bool = False)` — pruning (the old behavior) now requires `--prune-orphans`. Default
+  keeps orphaned pages and carries their render-manifest entry forward so a later `--prune-orphans`
+  run can still find/clean them. User explicitly chose NOT to touch `cleanupPeriodDays` itself —
+  source retention stays 30 days; only the *rendered* archive becomes durable.
+- **P1 — User changed the design mid-session: archived sessions must be LISTED, not just kept on
+  disk.** `Built:` new `.archive-cards.json` sidecar captures each live session's card-display
+  fields (title/cost/tokens/counts/timestamps — `_CARD_FIELDS`/`_card_fields()`) on every run. When
+  a session goes orphan, its last-captured fields reconstruct a lightweight `ArchivedCard`
+  (duck-typed stand-in for `Session`, same attribute names, `is_archived=True`) that `_index_page`
+  renders as a normal card — interleaved by date, `🗄 archived` pill, dimmed `.card.archived` style —
+  linking to the still-frozen `sessions/<id>.html`. **User-confirmed:** sidebar cost/token rollups
+  include archived sessions (true all-time totals, not just live).
+- **Two-stage adversarial review, both caught real bugs:**
+  - Stage 1 (prune→archive-default): clean — the default path deletes nothing, no other call sites
+    broke on the 3→4-tuple return change.
+  - Stage 2 (listed archive): duck-typing surface came back clean (`_index_page` and every helper it
+    calls only ever touch attributes both `Session` and `ArchivedCard` share — verified no path
+    reaches `.entries`/`.project_path`/`._expansions`/`.turn_durations`), but found two real MEDIUM
+    bugs, both fixed: (a) the `archived` return count included orphans that were kept on disk but had
+    **no card metadata to render** (e.g. the first run right after this upgrade, before the sidecar
+    existed) — it was claiming "still listed" for pages that weren't actually listed; fixed by
+    deriving `archived = len(archived_stubs)` instead of counting every orphan. (b) `ArchivedCard(**fields)`
+    doesn't type-check — a corrupt/hand-edited sidecar row (e.g. `cost_usd` as a string) would flow
+    into unguarded downstream code (`sorted(..., key=lambda s: s.last_ts)`, `.4f` cost formatting,
+    token-sum arithmetic) and crash the **whole index render**, not just that card; fixed with a new
+    `_archived_card_from_fields()` validator (explicit isinstance checks per field, bool-vs-int
+    subclass trap handled) that drops non-conforming rows instead of constructing from them.
+  - **Lesson for next time:** a mid-session design pivot (user changed their mind after the first
+    review) is a fresh trigger for adversarial review, not a "already reviewed this area" skip — the
+    new persistence layer (sidecar + duck-typed merge into rendering) was a materially different risk
+    surface than the first stage's plain opt-in flag.
+- **Storage impact (measured, not estimated):** 160 sessions → 70MB rendered output (62MB html +
+  7.8MB md, ~437KB/session avg) vs 311MB of source `.jsonl` (steady-state, bounded by the 30-day
+  cleanup). Sidecars are negligible (`.archive-cards.json` 109KB, `.render-manifest.json` 13.7KB,
+  `.title-cache.json` 48KB for 160 sessions). Net effect of this feature: the dashboard output was
+  previously ALSO steady-state (~70MB, mirroring the 30-day source window); now it only grows.
+  Using current session-creation pace as a proxy: **~70MB/month, ~840MB/year, linear** (not
+  compounding — each page is written once). Trivial on modern disk; not a real constraint.
+- **Tests:** 112 → 114 (2 new regression tests for the stage-2 review findings:
+  `test_archived_count_reflects_only_actually_listed_cards`,
+  `test_corrupt_archive_card_row_is_dropped_not_crashed`), plus 3 new stage-2 tests for the listing
+  feature itself and 1 renamed/split stage-1 test. All verified end-to-end on real data in scratch
+  dirs (never touched `~/.claude/projects` directly) across all three code paths (archive-default,
+  `--prune-orphans`, and the real live dashboard refresh, `--no-titles` to keep it $0).
+- **CLAUDE.md updated** with a "Retention/archive" section documenting `cleanupPeriodDays`'s role,
+  the default-archive/opt-in-prune behavior, and the three generator-owned dotfiles.
+- **Status:** Built, shipped, live dashboard refreshed.
+
 ## Codebase review — 2026-07-09 (all TBD unless noted)
 
 Fidelity gaps verified against real `~/.claude/projects` data (counts as of 2026-07-09):

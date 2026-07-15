@@ -1337,7 +1337,78 @@ def _atomic_write_text(path: str, content: str) -> None:
 
 
 RENDER_MANIFEST = ".render-manifest.json"
+ARCHIVE_CARDS = ".archive-cards.json"
 _GEN_HASH: str | None = None
+
+# Card fields needed to render an index card without the source .jsonl (title,
+# cost, tokens, counts, timestamps) — captured every render for every live
+# session, so a stub can still be built after the session's source disappears.
+_CARD_FIELDS = ("session_id", "project_name", "title", "agent_name", "summary",
+                "snippet", "last_ts", "n_user", "n_asst", "initiated_by_sdk",
+                "cost_usd", "cost_complete", "tok_in", "tok_out",
+                "tok_cache_read", "tok_cache_write")
+
+
+@dataclass
+class ArchivedCard:
+    """Lightweight stand-in for a Session whose source .jsonl is gone. Carries
+    just the fields _index_page needs to render a card; the full transcript
+    still lives in its frozen sessions/<id>.html — this only restores its
+    listing."""
+    session_id: str
+    project_name: str
+    title: str
+    agent_name: str
+    summary: str
+    snippet: str
+    last_ts: str
+    n_user: int
+    n_asst: int
+    initiated_by_sdk: bool
+    cost_usd: float
+    cost_complete: bool
+    tok_in: int
+    tok_out: int
+    tok_cache_read: int
+    tok_cache_write: int
+    is_archived: bool = True
+
+
+def _card_fields(s: Session) -> dict:
+    return {k: getattr(s, k) for k in _CARD_FIELDS}
+
+
+def _archived_card_from_fields(fields: dict) -> ArchivedCard | None:
+    """Build an ArchivedCard from a persisted .archive-cards.json row,
+    defensively. The dataclass constructor does NOT type-check, so a
+    corrupt/hand-edited or cross-version sidecar row (e.g. cost_usd as a
+    string, last_ts as null) would otherwise flow straight into unguarded
+    downstream code — sorting by last_ts, `.4f` cost formatting, token
+    arithmetic — and crash the WHOLE index render, not just that one card.
+    Anything that doesn't conform is dropped (returns None), matching this
+    file's existing posture of corrupt-data-self-heals-by-disappearing (see
+    the manifest's isinstance(sid, str) guard)."""
+    def _is_int(v: object) -> bool:
+        return isinstance(v, int) and not isinstance(v, bool)  # bool is an int subclass
+
+    str_fields = ("session_id", "project_name", "title", "agent_name",
+                  "summary", "snippet", "last_ts")
+    bool_fields = ("initiated_by_sdk", "cost_complete")
+    int_fields = ("n_user", "n_asst", "tok_in", "tok_out",
+                  "tok_cache_read", "tok_cache_write")
+    if not all(isinstance(fields.get(k), str) for k in str_fields):
+        return None
+    if not all(isinstance(fields.get(k), bool) for k in bool_fields):
+        return None
+    if not all(_is_int(fields.get(k)) for k in int_fields):
+        return None
+    cost = fields.get("cost_usd")
+    if not isinstance(cost, (int, float)) or isinstance(cost, bool):
+        return None
+    try:
+        return ArchivedCard(**{k: fields[k] for k in _CARD_FIELDS}, is_archived=True)
+    except KeyError:
+        return None
 
 
 def _generator_hash() -> str:
@@ -1367,10 +1438,16 @@ def _session_render_fp(s: Session) -> str:
     return hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()
 
 
-def write_site(sessions: list[Session], output_dir: str) -> tuple[int, int, int]:
+def write_site(sessions: list[Session], output_dir: str,
+               prune_orphans: bool = False) -> tuple[int, int, int, int]:
     """Render the site incrementally: only sessions whose fingerprint changed (or
-    whose files are missing) are re-rendered; pages of deleted sessions are
-    pruned. Returns (written, skipped, pruned)."""
+    whose files are missing) are re-rendered. Pages of sessions whose source
+    .jsonl has disappeared (e.g. pruned by Claude Code's cleanupPeriodDays) are
+    KEPT and stay LISTED by default (as an ArchivedCard reconstructed from their
+    last-captured card fields, flagged 🗄 archived) — the dashboard doubles as a
+    permanent, browsable archive — unless prune_orphans=True, which restores the
+    old mirror-only behavior and deletes them. Returns (written, skipped, pruned,
+    archived)."""
     sessions_dir = os.path.join(output_dir, "sessions")
     os.makedirs(sessions_dir, exist_ok=True)
     _write_assets(output_dir)
@@ -1385,6 +1462,17 @@ def write_site(sessions: list[Session], output_dir: str) -> tuple[int, int, int]
             manifest = {}
     if not isinstance(manifest, dict):
         manifest = {}
+
+    cards_path = os.path.join(output_dir, ARCHIVE_CARDS)
+    card_meta: dict = {}
+    if os.path.isfile(cards_path):
+        try:
+            with open(cards_path, encoding="utf-8") as fh:
+                card_meta = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            card_meta = {}
+    if not isinstance(card_meta, dict):
+        card_meta = {}
 
     new_manifest: dict = {}
     written = skipped = 0
@@ -1402,13 +1490,36 @@ def write_site(sessions: list[Session], output_dir: str) -> tuple[int, int, int]
         new_manifest[s.session_id] = fp
         written += 1
 
-    # Prune pages of sessions that no longer exist — but ONLY files this
-    # generator created (present in the previous manifest). --output-dir can
-    # point anywhere; never delete files we didn't write.
+    # Card fields (title/cost/tokens/etc.) for every live session, captured every
+    # run so a stub can still be built once its source .jsonl disappears.
+    new_card_meta: dict = {s.session_id: _card_fields(s) for s in sessions}
+
+    # Sessions whose source .jsonl is gone (Claude Code pruned it, or it moved).
+    # Default: archive — keep their pages, carry them forward in the manifest so
+    # a later --prune-orphans run can still find/clean them, and reconstruct an
+    # ArchivedCard from their last-captured fields so they stay listed in the
+    # index (flagged, not deleted). Opt-in prune_orphans restores the old mirror
+    # behavior and deletes the pages — but ONLY files this generator created
+    # (present in the previous manifest). --output-dir can point anywhere; never
+    # delete files we didn't write.
     current = {s.session_id for s in sessions}
     pruned = 0
+    archived_stubs: list[ArchivedCard] = []
     for sid in manifest:
         if sid in current:
+            continue
+        if not prune_orphans:
+            if isinstance(sid, str):
+                new_manifest.setdefault(sid, manifest[sid])
+                fields = card_meta.get(sid)
+                if isinstance(fields, dict):
+                    stub = _archived_card_from_fields(fields)
+                    if stub is not None:
+                        archived_stubs.append(stub)
+                        new_card_meta.setdefault(sid, fields)
+                    # else: no usable card metadata (e.g. this is the first run
+                    # after upgrading, or the sidecar row is corrupt) — the page
+                    # is still kept on disk, just not listed until it's rebuilt.
             continue
         for ext in ("html", "md"):
             fn = f"{sid}.{ext}"
@@ -1421,9 +1532,13 @@ def write_site(sessions: list[Session], output_dir: str) -> tuple[int, int, int]
                 pass
 
     _atomic_write_json(manifest_path, new_manifest)
+    _atomic_write_json(cards_path, new_card_meta)
+    all_cards = sorted([*sessions, *archived_stubs], key=lambda s: s.last_ts, reverse=True)
     # Write index last (atomically) so it never references a half-written page.
-    _atomic_write_text(os.path.join(output_dir, "index.html"), _index_page(sessions))
-    return written, skipped, pruned
+    _atomic_write_text(os.path.join(output_dir, "index.html"), _index_page(all_cards))
+    # archived == cards actually listed, NOT every orphan kept on disk (an orphan
+    # with no usable card metadata is kept but not counted — see the loop above).
+    return written, skipped, pruned, len(archived_stubs)
 
 
 def _write_assets(output_dir: str) -> None:
@@ -1504,14 +1619,19 @@ def _index_page(sessions: list[Session]) -> str:
         sdk_pill = ('<span class="sdk-pill" data-tip="Submitted by Claude or a tool '
                     '(a headless claude -p run), not typed by you">⚙ SDK</span>'
                     if s.initiated_by_sdk else "")
+        is_archived = getattr(s, "is_archived", False)
+        archived_pill = ('<span class="archived-pill" data-tip="Source session was '
+                          'removed (e.g. by Claude Code’s 30-day cleanup) — this '
+                          'is a saved snapshot">🗄 archived</span>' if is_archived else "")
         cards.append(
-            f'<a class="card{" active" if idx == 0 else ""}" href="{href}" target="content" '
+            f'<a class="card{" active" if idx == 0 else ""}'
+            f'{" archived" if is_archived else ""}" href="{href}" target="content" '
             f'onclick="selectCard(this)" style="--phue:{_hue(s.project_name)}" '
             f'data-project="{_esc(s.project_name)}" data-search="{haystack}" '
             f'data-cost="{s.cost_usd:.4f}" data-tok="{toks}" '
             f'data-inc="{0 if s.cost_complete else 1}">'
             f'<div class="card-top"><span class="proj-badge">{_esc(s.project_name)}</span>'
-            f'{sdk_pill}'
+            f'{sdk_pill}{archived_pill}'
             f'<span class="date">{badge}{_esc(_fmt_date(s.last_ts))}</span></div>'
             f'<div class="title">{_esc(s.title)}</div>'
             f'<div class="snippet">{_esc(blurb)}</div>'
@@ -1802,6 +1922,10 @@ font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px}
 @media (prefers-color-scheme:dark){.proj-badge{background:hsl(var(--phue,265) 38% 26%);color:hsl(var(--phue,265) 70% 80%)}}
 .sdk-pill{font-size:10.5px;font-weight:600;color:var(--accent);background:var(--badge);
   padding:2px 7px;border-radius:20px;cursor:help;white-space:nowrap}
+.archived-pill{font-size:10.5px;font-weight:600;color:var(--muted);background:var(--code);
+  padding:2px 7px;border-radius:20px;cursor:help;white-space:nowrap;border:1px dashed var(--line)}
+.card.archived{opacity:.72}
+.card.archived:hover{opacity:1}
 .date{color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px}
 .card-top .date{margin-left:auto}  /* right-pin the date in cards only; header .hmeta stays left-aligned */
 .active-badge{color:#16a34a;font-weight:700;font-size:10.5px;letter-spacing:.02em}
@@ -2220,6 +2344,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--title-model", default=TITLE_MODEL, help="model for the claude CLI titler")
     ap.add_argument("--projects-dir", default=DEFAULT_PROJECTS_DIR)
     ap.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    ap.add_argument("--prune-orphans", action="store_true",
+                    help="delete rendered pages whose source session was removed "
+                         "(default: keep them as a permanent archive)")
     args = ap.parse_args(argv)
 
     if not os.path.isdir(args.projects_dir):
@@ -2242,17 +2369,21 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_titles:
         cache, cache_path, todo = resolve_cached_titles(sessions, args.output_dir)
 
-    written, skipped, pruned = write_site(sessions, args.output_dir)
+    written, skipped, pruned, archived = write_site(
+        sessions, args.output_dir, prune_orphans=args.prune_orphans)
     stats = f"{written} page(s) rendered, {skipped} unchanged"
     if pruned:
         stats += f", {pruned} stale file(s) pruned"
+    if archived:
+        stats += f", {archived} archived (source removed, still listed)"
     print(f"Dashboard written to {index} ({stats})")
     if args.open:
         open_in_browser(index)
 
     if todo:
         if generate_titles(todo, cache, cache_path, args.title_model):
-            write_site(sessions, args.output_dir)  # rewrite with the fresh titles
+            # rewrite with the fresh titles
+            write_site(sessions, args.output_dir, prune_orphans=args.prune_orphans)
             print(f"  titles updated for {len(todo)} session(s) — "
                   f"refresh the dashboard to see them.")
     return 0

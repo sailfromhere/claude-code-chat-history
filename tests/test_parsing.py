@@ -107,6 +107,26 @@ class TestLoadSessions(unittest.TestCase):
             self.assertIn("⚙ SDK", html)
             self.assertEqual(html.count('class="sdk-pill"'), 1)  # only the sdk session
 
+    def test_archived_pill_appears_only_for_archived_cards(self):
+        # ArchivedCard is a duck-typed stand-in for Session (used by write_site to
+        # relist a session whose source .jsonl disappeared) — _index_page must
+        # flag it distinctly from a normal live card without erroring on the
+        # attributes it doesn't share with Session (e.g. no .entries).
+        with tempfile.TemporaryDirectory() as d:
+            write_jsonl(d, "human.jsonl", [typed_msg("hello there")], session_id="hum1")
+            live = cd.load_sessions(d)
+        stub = cd.ArchivedCard(
+            session_id="gone-x", project_name="oldproj", title="A Gone Session",
+            agent_name="", summary="", snippet="bye now", last_ts="2026-01-01T00:00:00",
+            n_user=1, n_asst=1, initiated_by_sdk=False, cost_usd=0.01, cost_complete=True,
+            tok_in=10, tok_out=10, tok_cache_read=0, tok_cache_write=0,
+        )
+        html = cd._index_page([*live, stub])
+        self.assertEqual(html.count('class="archived-pill"'), 1)  # only the stub
+        self.assertIn("A Gone Session", html)
+        self.assertIn('href="sessions/gone-x.html"', html)
+        self.assertIn('class="card archived"', html)
+
     def test_agent_name_used_as_title_fallback(self):
         # The harness-assigned session name beats the snippet-truncation fallback
         # (it's the name Claude Code's own UI shows) but never the AI title.

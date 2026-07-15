@@ -19,7 +19,7 @@ assets/                   # vendored highlight.js + light/dark themes (copied in
 ~/.claude/commands/chats.md   # global slash command: runs the generator + opens browser
 ```
 
-`python3 chats_dashboard.py [--open] [--no-titles] [--title-model M] [--projects-dir D] [--output-dir D]`
+`python3 chats_dashboard.py [--open] [--no-titles] [--title-model M] [--projects-dir D] [--output-dir D] [--prune-orphans]`
 
 Pipeline: scan `~/.claude/projects/*/*.jsonl` → group entries by `sessionId` (merges resumed
 sessions) → per session compute metadata + token/cost usage → optionally generate LLM
@@ -32,6 +32,20 @@ titles → render a static site to `~/.claude/history-dashboard/`:
 - `assets/` — highlight.js + `hl.css`.
 
 Files are written atomically (temp + `os.replace`); `index.html` is written last.
+
+**Retention/archive (added 2026-07-14):** Claude Code itself deletes source `.jsonl` files older
+than `cleanupPeriodDays` (default 30 — not set in this user's `~/.claude/settings.json`, so the
+default applies). The dashboard is deliberately NOT a mirror of that: by default, a session whose
+source `.jsonl` disappears keeps its rendered `sessions/<id>.{html,md}` AND stays **listed** in
+`index.html`, flagged `🗄 archived` (dimmed card style), reconstructed from a snapshot of its
+display fields (title/cost/tokens/counts/timestamps — see `_CARD_FIELDS`/`ArchivedCard` in
+`chats_dashboard.py`) captured into `.archive-cards.json` on every run. Sidebar cost/token rollups
+include archived sessions. Pass `--prune-orphans` to restore the old mirror-only behavior (delete
+pages once their source is gone) — off by default because the safer behavior (keep everything) is
+the sane default. `.render-manifest.json` drives incremental skip-if-unchanged rendering and (when
+`--prune-orphans` is passed) which pages to delete; all three dotfiles (`.render-manifest.json`,
+`.archive-cards.json`, `.title-cache.json`) live alongside `index.html` in the output dir and are
+generator-owned (never hand-edit).
 
 ## Three entry points (least-Claude first)
 1. Open the bookmarked `~/.claude/history-dashboard/index.html` (last snapshot — no Claude).
