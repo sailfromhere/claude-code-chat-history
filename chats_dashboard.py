@@ -594,6 +594,10 @@ def _result_map(entries: list[dict]) -> dict[str, dict]:
         if isinstance(c, list):
             for b in c:
                 if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id"):
+                    # AskUserQuestion's real answer (custom-typed text, notes) lives only in
+                    # the entry's top-level toolUseResult, not in this string content — stash
+                    # it on the block so _render_askq can read it. See _render_askq.
+                    b["_tur"] = e.get("toolUseResult")
                     out[b["tool_use_id"]] = b
     return out
 
@@ -681,8 +685,16 @@ def _inline(text: str) -> str:
         return f"\x00{len(codes) - 1}\x00"
 
     text = re.sub(r"`([^`]+)`", stash, text)                       # inline code (protected)
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)",
-                  r'<a href="\2" target="_blank" rel="noopener">\1</a>', text)
+
+    def link(m):
+        label, href = m.group(1), m.group(2)
+        # href text is untrusted (chat content, or — via AskUserQuestion — harness-controlled
+        # toolUseResult); block script-executing schemes so a crafted link can't become clickable.
+        if re.match(r"(?i)^\s*(javascript|data|vbscript):", href):
+            return m.group(0)
+        return f'<a href="{href}" target="_blank" rel="noopener">{label}</a>'
+
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", link, text)
     text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)  # bold
     text = re.sub(r"(?<!\w)__([^_]+)__(?!\w)", r"<strong>\1</strong>", text)
     text = re.sub(r"\*([^*\s][^*]*?)\*", r"<em>\1</em>", text)       # italic
@@ -936,15 +948,91 @@ def _render_edit_diff(name: str, inp: dict) -> str:
     return head + _diff_lines(str(inp.get("old_string", "")), str(inp.get("new_string", "")))
 
 
+def _split_multiselect(ans: str, labels: set[str]) -> tuple[set[str], str]:
+    """Peel known option labels out of a comma-joined multi-select answer — longest label
+    first, so a label that itself contains a comma isn't mis-split into leftover text.
+    Whatever isn't accounted for by a label is the user's own typed addition."""
+    remaining = ans
+    chosen: set[str] = set()
+    for lbl in sorted((l for l in labels if l), key=len, reverse=True):
+        idx = remaining.find(lbl)
+        if idx != -1:
+            chosen.add(lbl)
+            remaining = remaining[:idx] + remaining[idx + len(lbl):]
+    typed = re.sub(r"^[\s,]+|[\s,]+$", "", remaining)
+    typed = re.sub(r"[\s,]{2,}", ", ", typed)
+    return chosen, typed
+
+
+def _askq_answer(q: dict, tur, legacy_chosen: set[str]) -> tuple[set[str], str, str]:
+    """For one AskUserQuestion sub-question, return (chosen option labels, leftover
+    typed/custom "Other" text, attached note). Prefers the structured toolUseResult
+    (answers/annotations keyed by question text — stashed onto the result block by
+    _result_map). Falls back to `legacy_chosen` (labels scraped out of the old
+    '...="Label"...' result string) when toolUseResult isn't the expected dict — a
+    rejected/timed-out call carries a plain string there instead, and older captures may
+    have none at all.
+
+    toolUseResult is harness-controlled JSONL, i.e. untrusted: every nested value is
+    independently type-checked below so a malformed shape degrades to "no answer" rather
+    than raising and taking down the whole dashboard build (write_site has no per-session
+    try/except around rendering)."""
+    if not isinstance(q, dict):
+        return set(), "", ""
+    qtext = q.get("question")
+    qtext = qtext if isinstance(qtext, str) else ""
+    options = q.get("options")
+    labels = ({o.get("label", "") for o in options if isinstance(o, dict)}
+              if isinstance(options, list) else set())
+
+    if not isinstance(tur, dict):
+        return {lbl for lbl in labels if lbl in legacy_chosen}, "", ""
+
+    answers = tur.get("answers")
+    ans = answers.get(qtext) if isinstance(answers, dict) else None
+    ans = ans if isinstance(ans, str) else ""
+
+    annotations = tur.get("annotations")
+    qa = annotations.get(qtext) if isinstance(annotations, dict) else None
+    note = qa.get("notes") if isinstance(qa, dict) else ""
+    note = note if isinstance(note, str) else ""
+
+    if not ans:
+        return set(), "", note
+    if q.get("multiSelect"):
+        chosen, typed = _split_multiselect(ans, labels)
+        return chosen, typed, note
+    if ans in labels:
+        return {ans}, "", note
+    return set(), ans, note  # single-select, didn't match a listed option → custom-typed text
+
+
 def _render_askq(inp: dict, result: dict | None) -> str:
-    """Readable Q&A card for an AskUserQuestion call, with the chosen option marked."""
-    answer = _tool_result_text(result.get("content")) if result else ""
-    chosen = set(re.findall(r'="([^"]+)"', answer))
+    """Readable Q&A card for an AskUserQuestion call: marks the chosen option(s), and — since
+    neither lives in the tool_result string the old version scraped — surfaces custom-typed
+    ("Other") answers and any note the user attached, both read from the entry's structured
+    toolUseResult via _askq_answer."""
+    tur = result.get("_tur") if result else None
+    answer_text = _tool_result_text(result.get("content")) if result else ""
+    # Legacy fallback for captures with no structured toolUseResult (older data, or a
+    # rejected/timed-out call whose toolUseResult is a plain string): scrape the chosen label
+    # out of the rendered "...=\"Label\"..." result string, as the old renderer did.
+    legacy_chosen = set(re.findall(r'="([^"]+)"', answer_text)) if not isinstance(tur, dict) else set()
     out = ['<div class="askq">']
-    for q in inp.get("questions", []) if isinstance(inp, dict) else []:
+    any_answer = False
+    questions = inp.get("questions") if isinstance(inp, dict) else None
+    for q in questions if isinstance(questions, list) else []:
+        if not isinstance(q, dict):
+            continue
+        chosen, typed, note = _askq_answer(q, tur, legacy_chosen)
+        if chosen or typed or note:
+            any_answer = True
         out.append(f'<div class="askq-q">❓ {_inline(q.get("question", ""))}</div>')
         out.append('<ul class="askq-opts">')
-        for opt in q.get("options", []):
+        options = q.get("options")
+        for opt in options if isinstance(options, list) else []:
+            if not isinstance(opt, dict):
+                continue
             lbl = opt.get("label", "")
             sel = " chosen" if lbl in chosen else ""
             mark = "✓ " if lbl in chosen else ""
@@ -953,7 +1041,17 @@ def _render_askq(inp: dict, result: dict | None) -> str:
                   f'<pre class="code">{_esc(prev)}</pre></details>') if prev else ""
             out.append(f'<li class="askq-opt{sel}">{mark}<b>{_esc(lbl)}</b>'
                        f' — {_inline(opt.get("description", ""))}{pv}</li>')
+        if typed:
+            out.append(f'<li class="askq-opt typed">✎ <b>{_inline(typed)}</b>'
+                       f' <span class="muted">(typed answer)</span></li>')
         out.append("</ul>")
+        if note:
+            out.append(f'<div class="askq-note">💬 {_inline(note)}</div>')
+    if not any_answer and result is not None:
+        if "away from keyboard" in answer_text or "No response after" in answer_text:
+            out.append('<div class="askq-note">⏱ no answer (timed out)</div>')
+        elif result.get("is_error"):
+            out.append('<div class="askq-note">↩ sent back to clarify</div>')
     out.append("</div>")
     return "".join(out)
 
@@ -1833,6 +1931,41 @@ def _session_markdown(s: Session) -> str:
                     continue
                 if b.get("type") == "text" and b.get("text", "").strip():
                     lines.append(f"**Claude:** {_strip_ansi(b['text']).strip()}\n")
+                elif b.get("type") == "tool_use" and b.get("name") == "AskUserQuestion":
+                    res = results.get(b.get("id"))
+                    tur = res.get("_tur") if res else None
+                    inp = b.get("input", {}) or {}
+                    answer_text = _tool_result_text(res.get("content")) if res else ""
+                    legacy_chosen = (set(re.findall(r'="([^"]+)"', answer_text))
+                                     if not isinstance(tur, dict) else set())
+                    any_answer = False
+                    questions = inp.get("questions") if isinstance(inp, dict) else None
+                    for q in questions if isinstance(questions, list) else []:
+                        if not isinstance(q, dict):
+                            continue
+                        lines.append(f"> ❓ {q.get('question', '')}")
+                        chosen, typed, note = _askq_answer(q, tur, legacy_chosen)
+                        if chosen or typed or note:
+                            any_answer = True
+                        options = q.get("options")
+                        for opt in options if isinstance(options, list) else []:
+                            if not isinstance(opt, dict):
+                                continue
+                            lbl = opt.get("label", "")
+                            mark = "✓ " if lbl in chosen else "- "
+                            lines.append(f">   {mark}{lbl}")
+                        if typed:
+                            lines.append(f">   ✎ {typed} (typed answer)")
+                        if note:
+                            lines.append(f">   💬 {note}")
+                    if not any_answer and res is not None:
+                        if "away from keyboard" in answer_text or "No response after" in answer_text:
+                            lines.append("> ↳ ⏱ no answer (timed out)")
+                        elif res.get("is_error"):
+                            lines.append("> ↳ ↩ sent back to clarify")
+                        else:
+                            lines.append(f"> ↳ {_truncate(answer_text, 200)}")
+                    lines.append("")
                 elif b.get("type") == "tool_use":
                     summ = _tool_summary(b.get("name", ""), b.get("input", {}))
                     lines.append(f"> ▸ {b.get('name')}: {summ}")
@@ -2050,6 +2183,9 @@ font-size:12.5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .askq-opt.chosen{border-color:var(--accent);box-shadow:inset 3px 0 0 var(--accent);font-weight:500}
 .askq-prev{margin-top:5px}
 .askq-prev summary{cursor:pointer;color:var(--muted);font-size:12px}
+.askq-opt.typed{border-style:dashed;border-color:var(--accent);font-style:italic}
+.askq-note{margin-top:6px;padding:5px 9px;font-size:13px;color:var(--muted);background:var(--panel);border-radius:7px}
+.muted{color:var(--muted);font-style:normal;font-weight:400}
 .tool{margin:8px 0;border:1px solid var(--line);border-radius:8px;padding:4px 8px}
 .tool summary{cursor:pointer;color:var(--muted);font-size:13px}
 .tool[open]{padding-bottom:8px}

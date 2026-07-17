@@ -169,6 +169,207 @@ class TestTurnDuration(unittest.TestCase):
         self.assertNotIn("model-divider", all_turn_html(s))
 
 
+def askq_call(questions: list[dict], tid: str = "q1") -> dict:
+    return tool_use_block("AskUserQuestion", {"questions": questions}, tid)
+
+
+class TestAskUserQuestion(unittest.TestCase):
+    """The AskUserQuestion card must reflect the real answer, which lives in the entry's
+    top-level toolUseResult (answers/annotations keyed by question text) — not the tool_result
+    string, which the old regex-only renderer scraped. Real-data shapes verified 2026-07-14/15
+    (custom-typed "Other" answers and notes are absent from the string entirely)."""
+
+    QUESTION = {
+        "question": "Which approach?",
+        "header": "Approach",
+        "multiSelect": False,
+        "options": [
+            {"label": "Option A", "description": "the first way"},
+            {"label": "Option B", "description": "the second way"},
+        ],
+    }
+
+    def test_picked_option_marked_chosen(self):
+        s = make_session([
+            user_msg("go"),
+            assistant_blocks([askq_call([self.QUESTION])]),
+            tool_result_entry("q1", 'Your questions have been answered: "Which approach?"="Option A"',
+                              tool_use_result={"questions": [self.QUESTION],
+                                              "answers": {"Which approach?": "Option A"},
+                                              "annotations": {}}),
+        ])
+        html = all_turn_html(s)
+        self.assertIn('askq-opt chosen', html)
+        self.assertIn("Option A", html)
+        self.assertNotIn("typed answer", html)
+
+    def test_custom_typed_answer_shown_not_dropped(self):
+        typed = "do neither, use a hybrid of both instead"
+        s = make_session([
+            user_msg("go"),
+            assistant_blocks([askq_call([self.QUESTION])]),
+            tool_result_entry("q1", f'Your questions have been answered: "Which approach?"="{typed}"',
+                              tool_use_result={"questions": [self.QUESTION],
+                                              "answers": {"Which approach?": typed},
+                                              "annotations": {}}),
+        ])
+        html = all_turn_html(s)
+        self.assertIn(typed, html)
+        self.assertIn("typed answer", html)
+        self.assertNotIn('askq-opt chosen', html)  # neither listed option was picked
+
+    def test_note_rendered(self):
+        note = "also, why did this only break after the merge yesterday?"
+        s = make_session([
+            user_msg("go"),
+            assistant_blocks([askq_call([self.QUESTION])]),
+            tool_result_entry("q1", 'Your questions have been answered: "Which approach?"="Option A"',
+                              tool_use_result={"questions": [self.QUESTION],
+                                              "answers": {"Which approach?": "Option A"},
+                                              "annotations": {"Which approach?": {"notes": note}}}),
+        ])
+        html = all_turn_html(s)
+        self.assertIn("askq-note", html)
+        self.assertIn(note, html)
+
+    def test_multiselect_marks_every_chosen_label(self):
+        q = {**self.QUESTION, "multiSelect": True,
+            "options": [{"label": "A", "description": "a"}, {"label": "B", "description": "b"},
+                       {"label": "C", "description": "c"}]}
+        s = make_session([
+            user_msg("go"),
+            assistant_blocks([askq_call([q])]),
+            tool_result_entry("q1", 'Your questions have been answered: "Which approach?"="A, C"',
+                              tool_use_result={"questions": [q],
+                                              "answers": {"Which approach?": "A, C"},
+                                              "annotations": {}}),
+        ])
+        html = all_turn_html(s)
+        self.assertEqual(html.count("askq-opt chosen"), 2)
+
+    def test_timeout_shows_no_answer_status(self):
+        s = make_session([
+            user_msg("go"),
+            assistant_blocks([askq_call([self.QUESTION])]),
+            tool_result_entry("q1",
+                              "No response after 60s — the user may be away from keyboard.",
+                              tool_use_result={"questions": [self.QUESTION],
+                                              "answers": {}, "annotations": {},
+                                              "afkTimeoutMs": 60000}),
+        ])
+        html = all_turn_html(s)
+        self.assertIn("no answer", html)
+        self.assertNotIn("askq-opt chosen", html)
+
+    def test_rejected_clarify_shows_status_not_string_tooluseresult(self):
+        # A rejected/clarify call's toolUseResult is a plain string, not the answers dict —
+        # must not crash and must not be mistaken for a structured answer.
+        s = make_session([
+            user_msg("go"),
+            assistant_blocks([askq_call([self.QUESTION])]),
+            tool_result_entry("q1", "The user doesn't want to proceed with this tool use.",
+                              is_error=True,
+                              tool_use_result="Error: The user doesn't want to proceed..."),
+        ])
+        html = all_turn_html(s)
+        self.assertIn("sent back to clarify", html)
+
+    def test_legacy_capture_without_structured_result_still_marks_chosen(self):
+        # Older captures (or synthetic data) with no top-level toolUseResult at all — falls
+        # back to the old string-scrape so this doesn't regress.
+        s = make_session([
+            user_msg("go"),
+            assistant_blocks([askq_call([self.QUESTION])]),
+            tool_result_entry("q1", 'Your questions have been answered: "Which approach?"="Option B"'),
+        ])
+        html = all_turn_html(s)
+        self.assertIn('askq-opt chosen', html)
+        self.assertIn("Option B", html)
+
+    def test_markdown_export_includes_typed_answer_and_note(self):
+        typed = "a hybrid approach"
+        note = "leave the door open for later"
+        s = make_session([
+            user_msg("go"),
+            assistant_blocks([askq_call([self.QUESTION])]),
+            tool_result_entry("q1", f'Your questions have been answered: "Which approach?"="{typed}"',
+                              tool_use_result={"questions": [self.QUESTION],
+                                              "answers": {"Which approach?": typed},
+                                              "annotations": {"Which approach?": {"notes": note}}}),
+        ])
+        md = cd._session_markdown(s)
+        self.assertIn(typed, md)
+        self.assertIn(note, md)
+
+    def test_markdown_export_marks_chosen_for_legacy_capture(self):
+        # A legacy capture (no toolUseResult) must mark the chosen option in markdown too,
+        # not just HTML — this regressed before the two render paths shared one extractor.
+        s = make_session([
+            user_msg("go"),
+            assistant_blocks([askq_call([self.QUESTION])]),
+            tool_result_entry("q1", 'Your questions have been answered: "Which approach?"="Option B"'),
+        ])
+        md = cd._session_markdown(s)
+        self.assertIn("✓ Option B", md)
+
+    def test_multiselect_label_containing_comma_not_split(self):
+        # A label that itself contains a comma must not be mis-parsed into leftover
+        # "typed" text when peeled out of the comma-joined multi-select answer.
+        q = {**self.QUESTION, "multiSelect": True,
+            "options": [{"label": "Rename, then delete", "description": "a"},
+                       {"label": "Keep as-is", "description": "b"}]}
+        s = make_session([
+            user_msg("go"),
+            assistant_blocks([askq_call([q])]),
+            tool_result_entry("q1", 'answered',
+                              tool_use_result={"questions": [q],
+                                              "answers": {"Which approach?":
+                                                          "Rename, then delete, Keep as-is"},
+                                              "annotations": {}}),
+        ])
+        html = all_turn_html(s)
+        self.assertEqual(html.count("askq-opt chosen"), 2)
+        self.assertNotIn("typed answer", html)
+
+    def test_malformed_tool_use_result_never_crashes(self):
+        # toolUseResult is harness-controlled JSONL — malformed/adversarial shapes must
+        # degrade gracefully, not raise and take the whole dashboard build down.
+        bad_shapes = [
+            {"questions": [self.QUESTION], "answers": {}, "annotations": {"Which approach?": "not a dict"}},
+            {"questions": [self.QUESTION], "answers": ["not", "a", "dict"], "annotations": {}},
+            {"questions": [self.QUESTION], "answers": {"Which approach?": ["A", "B"]}, "annotations": {}},
+            {"questions": [self.QUESTION], "answers": {"Which approach?": 7}, "annotations": {}},
+            {"questions": ["not a dict"], "answers": {}, "annotations": {}},
+            ["not", "a", "dict"],
+            42,
+        ]
+        for tur in bad_shapes:
+            with self.subTest(tur=tur):
+                s = make_session([
+                    user_msg("go"),
+                    assistant_blocks([askq_call([self.QUESTION])]),
+                    tool_result_entry("q1", "some result text", tool_use_result=tur),
+                ])
+                all_turn_html(s)          # must not raise
+                cd._session_markdown(s)   # must not raise
+
+    def test_javascript_link_in_typed_answer_neutralized(self):
+        # Untrusted answer/note text can contain markdown-link syntax; a javascript: href
+        # must not become a clickable anchor in the rendered card.
+        s = make_session([
+            user_msg("go"),
+            assistant_blocks([askq_call([self.QUESTION])]),
+            tool_result_entry("q1", "result",
+                              tool_use_result={"questions": [self.QUESTION],
+                                              "answers": {"Which approach?":
+                                                          "[click](javascript:alert(1))"},
+                                              "annotations": {}}),
+        ])
+        html = all_turn_html(s)
+        self.assertNotIn('href="javascript:', html)
+        self.assertIn("click", html)
+
+
 class TestToolSummary(unittest.TestCase):
     """Collapsed-chip one-liners for newer tools (shapes verified 2026-07-09)."""
 

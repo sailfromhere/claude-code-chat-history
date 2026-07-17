@@ -6,6 +6,82 @@ keep the active backlog lean. **Open items live in `IMPROVEMENTS.md`.** Entries 
 `IMPROVEMENTS.md` "Closed" index points you to one. Status legend: Built · Decided · Fixed ·
 Superseded · Dropped · Rejected · Closed.
 
+## Log — 2026-07-15 — AskUserQuestion card: custom-typed answers and notes were invisible
+
+**Trigger:** user reported two AskUserQuestion rendering bugs: (1) when they typed custom text
+instead of picking a listed option, and (2) when they added a note to their answer, neither
+showed up in the dashboard's Q&A card.
+
+**Root cause:** `_render_askq` only ever read the paired `tool_result` *string* and regex-matched
+`="Label"` against it (`re.findall(r'="([^"]+)"', answer)`) to mark the chosen option. Verified
+empirically against real JSONL: the reliable structured data — `answers` (question text →
+answer string) and `annotations` (question text → `{notes, preview}`) — lives **only** in the
+JSONL line's top-level `toolUseResult` field, which the renderer never read. So: custom text
+matched no option label → nothing marked, text never shown; note text was never in the string
+at all → completely invisible. Also found, same root cause: multi-select answers are
+comma-joined label strings, so the old regex marked *nothing* for multi-select either.
+
+- **Built:** `_result_map` now stashes `e.get("toolUseResult")` onto each tool_result block as
+  `b["_tur"]`. New `_askq_answer(q, tur, legacy_chosen)` (chats_dashboard.py) reads it: exact-match
+  against option labels for single-select, `_split_multiselect` (longest-label-first matching,
+  so a label containing its own comma isn't mis-split) for multi-select; anything left over is
+  the user's typed "Other" text. `_render_askq` renders it as a distinct `.askq-opt.typed` list
+  item, notes as `.askq-note`, and a status line (`⏱ no answer` / `↩ sent back to clarify`) when
+  nothing was answered. `_session_markdown` gained a parallel branch using the same extractor, so
+  the `.md` export and HTML no longer disagree.
+- **Adversarial review (first pass) caught real crash bugs before ship, all fixed:**
+  - **CRITICAL:** `toolUseResult` is harness-controlled JSONL — untrusted. The first cut only
+    checked `isinstance(tur, dict)` and trusted every nested value (`answers`/`annotations`
+    entries, `questions`/`options` elements) to be the expected type. Five confirmed crash
+    shapes (non-dict annotation value, `answers` as a list, answer value as a list/int,
+    non-dict question element) — and because `write_site` has no per-session try/except around
+    rendering, *one* malformed session would have taken down the entire dashboard regen, not
+    just that card. Fixed: every level in `_askq_answer` is now independently type-checked
+    (`isinstance` guards on `q`, `options`/`opt`, `answers`/`annotations`/`qa`, `ans`/`note`),
+    same for the `questions`/`options` iteration loops in `_render_askq` and the markdown
+    branch — malformed shapes now degrade to "no answer" instead of raising. Verified against
+    10 adversarial shapes (incl. `tur` itself being a list/int) — none crash.
+  - **MEDIUM:** `_inline`'s markdown-link substitution had no scheme allowlist, so a
+    `[x](javascript:...)` in a note or typed answer would render as a clickable, script-executing
+    link (a pre-existing hole in `_inline`, newly reachable via these two untrusted sources).
+    Fixed at the source (`_inline`, chats_dashboard.py:678): `javascript:`/`data:`/`vbscript:`
+    hrefs now render as literal escaped text instead of an anchor — fixes it everywhere `_inline`
+    is used, not just this card.
+  - **MEDIUM:** the markdown export path lacked the HTML path's legacy fallback (old captures
+    with no `toolUseResult` showed the chosen option in HTML but not in `.md`). Fixed by
+    factoring one shared `_askq_answer` used by both renderers, so they can't diverge again.
+  - **LOW:** multi-select's naive `ans.split(",")` would mis-split an option label that itself
+    contains a comma into leftover "typed" text. Fixed via `_split_multiselect` (greedy,
+    longest-label-first matching against known labels before treating anything as custom text).
+- **Verification:** 126 unit tests (7 original + 5 added post-review: malformed-shape fuzz test
+  with 7 sub-cases, javascript-link neutralization, comma-in-label multiselect, legacy-markdown
+  chosen-marking), all passing (~1s, offline/$0). Regenerated the real dashboard (162 sessions,
+  0 errors) and confirmed against known real sessions: `d1926e4d…` (custom-typed answer),
+  `f862bde9…`/`f72da969…` under trip_planner (notes) — all three render correctly; grepped the
+  full generated output for `href="javascript:` — zero matches.
+- **Resolves the 2026-06-13 P2 "AskUserQuestion 'chose to discuss instead' outcome not
+  reflected" backlog item (moved from `IMPROVEMENTS.md`, verbatim):**
+
+  > When Claude shows the options window and the user picks the **last/Other path to discuss it
+  > more** (i.e. rejects the tool call to talk rather than selecting a listed option), the
+  > dashboard card shows the question + all options with **none marked**, indistinguishable from
+  > a never-answered question — it hides that the user deliberately chose to discuss.
+  > - **Validated data shape (2026-06-13):** the rejection is a `tool_result` paired to the
+  >   `AskUserQuestion` tool_use, with `is_error: true` and content like *"The user doesn't want
+  >   to proceed with this tool use… The user wants to clarify these questions… Questions asked:
+  >   - \"…\" (No answer provided)"*. A real answer instead has content shaped
+  >   `"Question"="Chosen Label" …`.
+  > - **Why it renders blank:** `_render_askq` finds the chosen label via
+  >   `re.findall(r'="([^"]+)"', answer)`. The rejection text has no `="…"` token → `chosen` is
+  >   empty → no option marked, and the card isn't flagged as rejected/error either.
+  > - **Fix options:** detect `result.is_error` + the "doesn't want to proceed"/"No answer
+  >   provided" signature → render an explicit outcome line on the card. Related nuance: a typed
+  >   **"Other" custom answer** (not a listed label) also won't match the regex — its text lands
+  >   in the *next* user message; consider surfacing that too.
+
+  Both the outcome line (`↩ sent back to clarify`) and the custom-typed-answer surfacing this
+  entry called for were built above, as part of the broader structured-`toolUseResult` rewrite.
+
 ## Log — 2026-07-14 — dashboard becomes a durable, browsable archive
 
 **Trigger:** user noticed chats older than ~30 days were missing from the dashboard. Root cause was

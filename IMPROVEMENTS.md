@@ -119,27 +119,6 @@ How Claude Code's `/btw` and `/fork` show up in the dashboard's data (verified 2
 - **`/btw`** — an *escaped* `/btw` writes ONLY to global `~/.claude/history.jsonl` (which the dashboard never reads), no transcript → **invisible to the dashboard**. Behavior of a *completed* `/btw` (merge into current sessionId vs new sessionId) is **unsampled** — need a real non-escaped capture before deciding any handling.
 - **Status:** TBD, low priority. Next step when revisited: capture a completed `/btw`, add a fixture, then decide.
 
-### AskUserQuestion "chose to discuss instead" outcome not reflected — P2, TBD
-When Claude shows the options window and the user picks the **last/Other path to discuss it more**
-(i.e. rejects the tool call to talk rather than selecting a listed option), the dashboard card shows
-the question + all options with **none marked**, indistinguishable from a never-answered question —
-it hides that the user deliberately chose to discuss.
-- **Validated data shape (2026-06-13, this session):** the rejection is a `tool_result` paired to the
-  `AskUserQuestion` tool_use, with `is_error: true` and content like *"The user doesn't want to proceed
-  with this tool use… The user wants to clarify these questions… Questions asked: - \"…\" (No answer
-  provided)"*. A real answer instead has content shaped `"Question"="Chosen Label" …`.
-- **Why it renders blank:** `_render_askq` (chats_dashboard.py) finds the chosen label via
-  `re.findall(r'="([^"]+)"', answer)`. The rejection text has no `="…"` token → `chosen` is empty →
-  no option marked, and the card isn't flagged as rejected/error either.
-- **Fix options:** detect `result.is_error` + the "doesn't want to proceed"/"No answer provided"
-  signature → render an explicit outcome line on the card (e.g. *"↪ Chose to discuss instead — no
-  option selected"*), distinct from a genuinely unanswered question. Related nuance: a typed **"Other"
-  custom answer** (not a listed label) also won't match the regex — its text lands in the *next* user
-  message; consider surfacing that too.
-- **Add a fixture before fixing** (per project workflow): synthetic AskUserQuestion tool_use + an
-  is_error rejection tool_result → assert the card shows the "discuss instead" outcome.
-- **User (2026-06-14):** logged as an idea, not prioritized. Status: TBD.
-
 ### Filter by prompt provenance (hide/show SDK-run chats) — P2, TBD
 Now that Claude/tool-run sessions are flagged (`initiated_by_sdk`, `⚙ SDK` pill), add a way to
 filter the card list by it — e.g. a "hide SDK runs" toggle, or make the pill click-to-filter
@@ -172,6 +151,7 @@ Show total tokens used, cache hits, model used — useful for cost-awareness. **
 ---
 
 ## Closed (full detail → `IMPROVEMENTS_DONE.md`)
+- AskUserQuestion card: custom-typed answers + notes now shown (were invisible); crash-hardened against malformed `toolUseResult`; also resolves the 2026-06-13 "chose to discuss instead" outcome item — Built 2026-07-15
 - Dashboard becomes a durable, browsable archive (kept + listed past Claude Code's 30-day cleanup) — Built 2026-07-14
 - Interrupts / compact summaries / pasted images / agent-name / TodoWrite→Task* / plan outcome badges / tool-chip summaries / per-turn model+duration — Built 2026-07-09 (codebase review)
 - Nested markdown lists, `_atomic_write_json` cleanup, PRICING prefix fallback, memoized re-parsing, incremental `write_site` — Built 2026-07-09

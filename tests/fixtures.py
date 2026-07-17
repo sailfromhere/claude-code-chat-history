@@ -131,12 +131,18 @@ def image_block(data: str = "iVBORw0KGgoAAAANSUhEUgFAKE", media: str = "image/pn
     return {"type": "image", "source": {"type": "base64", "media_type": media, "data": data}}
 
 
-def tool_result_entry(tool_use_id: str, content, is_error: bool = False) -> dict:
-    """A user entry whose only content is a tool_result (the harness's reply)."""
+def tool_result_entry(tool_use_id: str, content, is_error: bool = False,
+                      tool_use_result=None) -> dict:
+    """A user entry whose only content is a tool_result (the harness's reply).
+    tool_use_result mirrors real JSONL's top-level toolUseResult field — used for
+    AskUserQuestion's structured answers/annotations, which live there, not in `content`."""
     block = {"type": "tool_result", "tool_use_id": tool_use_id, "content": content}
     if is_error:
         block["is_error"] = True
-    return _entry("user", [block])
+    e = _entry("user", [block])
+    if tool_use_result is not None:
+        e["toolUseResult"] = tool_use_result
+    return e
 
 
 # --- assistant entries ----------------------------------------------------- #
