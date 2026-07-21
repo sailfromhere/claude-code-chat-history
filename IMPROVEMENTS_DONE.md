@@ -6,6 +6,100 @@ keep the active backlog lean. **Open items live in `IMPROVEMENTS.md`.** Entries 
 `IMPROVEMENTS.md` "Closed" index points you to one. Status legend: Built · Decided · Fixed ·
 Superseded · Dropped · Rejected · Closed.
 
+## Log — 2026-07-20 — Session deletion, trash/recovery, retention, and bulk-delete
+
+**Trigger:** natural follow-up to the 2026-07-14 durable-archive feature — the opposite control.
+User wanted (1) delete specific sessions, recoverably, so a regen doesn't pull them back; (2) an
+optional retention period (default: keep forever); (3) bulk delete by criteria (age, project).
+
+**Hard constraint that shaped the whole design:** the dashboard is a serverless static site — its
+JS can't write files, and the project deliberately rejected a background server (2026-06-12
+"Option C"). So durable deletion state has to be a generator-owned dotfile, and every real mutation
+runs through a `chats` (generator) invocation; the browser can only build a `chats …` command for
+the user to copy/run.
+
+**Core design principle:** delete only ever ADDS a session id to a new `.deleted-sessions.json`
+trash file — it never removes entries from `.render-manifest.json`/`.archive-cards.json`. The trash
+set is a pure display/render filter (`write_site(deleted_sids=...)`): trashed sessions are skipped
+in the render loop and excluded from the final index card list, but their bookkeeping rows are
+carried forward untouched. This makes restore trivial and safe (drop from trash → the session
+reappears, live or as its archived stub) and confines all real file destruction to one path:
+`_empty_trash()` (used by both `--empty-trash` and the auto-purge sweep), which reuses the existing
+`--prune-orphans` path-traversal guard (`os.path.basename(fn) != fn`).
+
+**Built, in four batches (each adversarial-reviewed):**
+1. **Trash core:** `.deleted-sessions.json` (`load_trash`/`save_trash`, self-healing on
+   malformed rows — validates `deleted_at`/`reason` are strings and `fields` is dict-or-absent at
+   the load boundary, so no downstream consumer can crash on a hand-edited file), `_known_cards()`
+   (live sessions ∪ archived stubs rebuilt from `.archive-cards.json` — so retention/bulk selection
+   can reach source-gone orphans, not just live sessions), CLI `--delete SID...`/`--restore
+   SID...`/`--list-trash`.
+2. **Bulk + destructive ops:** `--delete-older-than DAYS`/`--delete-project NAME` (via
+   `_select_by_age`/`_select_by_project`), `--dry-run` (previews any action, mutates nothing),
+   `--empty-trash` (gated behind `--yes` or `--dry-run` — hard-deletes pages + drops
+   manifest/archive-cards/trash entries).
+3. **Retention config:** `.dashboard-config.json` (`retention_days`/`purge_days`, both `null` =
+   off = today's behavior), `--set-retention DAYS|off`/`--set-purge DAYS|off`. Every normal build
+   auto-trashes sessions older than `retention_days` (reason `"retention"`, still recoverable) and
+   auto-purges trash entries whose `deleted_at` has itself aged past `purge_days` (shared selection
+   logic `_stale_trash_sids`, also used by the `--dry-run` preview so the two can't drift apart).
+4. **Browser command-builder UI:** `data-sid` + a per-card 🗑 (opens a shared `#cmdDialog` with
+   the built command + Copy button) and a ⚙ "Cleanup & trash" panel (`#settingsPanel`) with three
+   sections — Bulk cleanup, Retention (shows current config + builds `--set-*` commands), Trash
+   (lists trashed sessions from the embedded-at-generation-time dict, each with a Restore command,
+   plus Empty trash). `shQuote()` POSIX-shell-quotes every user-controlled string (project names)
+   before it's shown, so a directory name containing quotes/`$`/backticks can't break or inject
+   into the copied command.
+
+**Two full-pass adversarial reviews (one per stage — core/CLI, then UI) found real bugs, all fixed
+and regression-tested — reinforces the "review-per-stage, not just per-feature" pattern:**
+- **HIGH (core):** `--restore` was silently reversed by the SAME run's auto-retention sweep — the
+  sweep re-selected the just-restored (still old) sid before the command even finished, since it
+  was no longer "in trash" to be skipped. Fixed: a sid named in this run's `--restore` is exempt
+  from this run's auto-retention sweep; a follow-up note warns if it's still past the threshold
+  (a later plain build will re-trash it unless retention is raised/disabled — that part is
+  intentional, only the same-run reversal was the bug).
+- **MEDIUM (core):** `_print_trash`/the settings-panel trash listing would crash on a hand-edited
+  `.deleted-sessions.json` row with a non-string `deleted_at` (`sorted()` on mixed str/int).
+  Fixed at the load boundary (`load_trash` now validates row shape) plus a defensive `str()`
+  coercion at both sort-key call sites.
+- **LOW (core):** `--dry-run` combined with `--set-retention`/`--set-purge` still wrote
+  `.dashboard-config.json`, contradicting "changing nothing." Fixed: config changes are computed
+  but only saved after the dry-run gate; `--dry-run` now also previews what the config-driven
+  auto-retention/auto-purge sweep would additionally do on a real run (previously it could print
+  "nothing to do" while the next real build silently swept a pile of sessions).
+- **LOW (core):** `retention_days=0`/`purge_days=0` are accepted (immediate/blanket effect) with no
+  extra confirmation — added an explicit warning printed when either is set to exactly 0.
+- **HIGH (UI):** the Retention panel's inputs started blank (current values shown only in a
+  separate read-only line) — building a command after touching just ONE field silently emitted
+  `--set-retention/--set-purge off` for the field the user never meant to change, wiping it. Fixed:
+  each input now pre-fills with its OWN current value (`_input_days_value`), so submitting an
+  untouched field reproduces it instead of coercing it to off.
+- **LOW (UI):** the global keydown handler (j/k/arrows/`/`) wasn't modal-aware — it could navigate
+  cards behind an open dialog/panel, and neither overlay closed on Escape. Fixed: the handler now
+  checks whether either overlay is open and, if so, only handles Escape-to-close.
+- **LOW (UI):** `.card-del{opacity:0}` hid the 🗑 but left it a live (invisible) tap target on
+  touch/no-hover. Fixed: `pointer-events:none` at opacity 0, restored to `auto` on hover/focus-within.
+- **Informational (UI, no fix needed):** the JS-string-inside-HTML-attribute escaping pattern
+  (`_esc()`/html.escape) used for the new onclick handlers is the SAME pattern already shipped for
+  `filterProject`, applied here to strictly more-constrained values (UUIDs) — no new injection
+  surface introduced. `shQuote` was verified to correctly handle embedded `'`, `$`, backticks, `;`,
+  and newlines.
+
+**Verification:** grew from 126 to 173 tests (`test_trash.py`, `test_trash_bulk.py`,
+`test_retention.py`, `test_ui_panel.py` — round-trip, non-resurrection, source-gone-orphan
+interplay, traversal-guard, boundary/age selection, config self-healing, and the modal/tap-target
+regressions above), each destructive-path assertion mutation-verified (deliberately broke the
+guard/filter, watched the test fail, then reverted). Real-data smoke tests against a throwaway
+output dir (never the live `~/.claude/history-dashboard/`) for delete/restore/list-trash/dry-run/
+retention/empty-trash. Visual verification via headless Chrome screenshots of the settings panel
+and command dialog (before and after the retention pre-fill fix).
+
+**New generator-owned dotfiles:** `.deleted-sessions.json`, `.dashboard-config.json` (alongside the
+existing `.render-manifest.json`/`.archive-cards.json`/`.title-cache.json`) — all five live in
+`--output-dir`, never hand-edit. CLAUDE.md's "Retention/archive" section updated with the full
+CLI-flag/dotfile summary.
+
 ## Log — 2026-07-15 — AskUserQuestion card: custom-typed answers and notes were invisible
 
 **Trigger:** user reported two AskUserQuestion rendering bugs: (1) when they typed custom text

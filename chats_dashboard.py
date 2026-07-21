@@ -1350,6 +1350,11 @@ def _minutes_since(ts: str) -> float | None:
     return (datetime.now().astimezone() - dt).total_seconds() / 60
 
 
+def _days_since(ts: str) -> float | None:
+    m = _minutes_since(ts)
+    return None if m is None else m / 1440
+
+
 def _is_active(ts: str) -> bool:
     """Recently active — its last activity is within ACTIVE_WINDOW_MIN of now."""
     m = _minutes_since(ts)
@@ -1436,7 +1441,25 @@ def _atomic_write_text(path: str, content: str) -> None:
 
 RENDER_MANIFEST = ".render-manifest.json"
 ARCHIVE_CARDS = ".archive-cards.json"
+TRASH_FILE = ".deleted-sessions.json"
+CONFIG_FILE = ".dashboard-config.json"
 _GEN_HASH: str | None = None
+
+
+def _read_json_dict(path: str) -> dict:
+    """Read a JSON object from path, self-healing to {} on missing/corrupt/wrong-
+    type content — the pattern already used inline for the render manifest and
+    the archive-cards sidecar, now shared so every generator-owned dotfile loads
+    the same defensive way."""
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if isinstance(data, dict):
+            return data
+    return {}
 
 # Card fields needed to render an index card without the source .jsonl (title,
 # cost, tokens, counts, timestamps) — captured every render for every live
@@ -1509,6 +1532,75 @@ def _archived_card_from_fields(fields: dict) -> ArchivedCard | None:
         return None
 
 
+def _known_cards(sessions: list[Session], output_dir: str) -> list:
+    """Every session the trash/retention/bulk-delete selection logic can act on:
+    live sessions plus archived stubs rebuilt from .archive-cards.json for
+    sessions whose source .jsonl is already gone. Each element exposes
+    .session_id/.project_name/.last_ts and works with _card_fields(). Live
+    sessions take precedence on id collision (shouldn't happen in practice —
+    a live session is never also an orphan — but this keeps the fresher data)."""
+    cards: list = list(sessions)
+    live_ids = {s.session_id for s in sessions}
+    card_meta = _read_json_dict(os.path.join(output_dir, ARCHIVE_CARDS))
+    for sid, fields in card_meta.items():
+        if sid in live_ids or not isinstance(fields, dict):
+            continue
+        stub = _archived_card_from_fields(fields)
+        if stub is not None:
+            cards.append(stub)
+    return cards
+
+
+def load_trash(output_dir: str) -> dict:
+    """Load the trash sidecar (.deleted-sessions.json): sid -> {deleted_at,
+    reason, fields}. Malformed rows are dropped silently (corrupt-data-self-
+    heals-by-disappearing, matching the manifest/archive-cards posture).
+    deleted_at/reason are validated as strings and fields as a dict-or-absent
+    HERE, at the load boundary, so every consumer (sorting/display/date
+    parsing) can trust the shape without repeating the check — a hand-edited
+    or cross-version row with e.g. deleted_at as a number would otherwise crash
+    a str/str sort (_print_trash) or an isoformat parse downstream."""
+    raw = _read_json_dict(os.path.join(output_dir, TRASH_FILE))
+    trash: dict = {}
+    for sid, row in raw.items():
+        if not (isinstance(sid, str) and isinstance(row, dict)):
+            continue
+        if not (isinstance(row.get("deleted_at"), str) and isinstance(row.get("reason"), str)):
+            continue
+        fields = row.get("fields")
+        if fields is not None and not isinstance(fields, dict):
+            continue
+        trash[sid] = row
+    return trash
+
+
+def save_trash(output_dir: str, trash: dict) -> None:
+    _atomic_write_json(os.path.join(output_dir, TRASH_FILE), trash)
+
+
+_CONFIG_DEFAULTS = {"retention_days": None, "purge_days": None}
+
+
+def load_config(output_dir: str) -> dict:
+    """Load the retention config sidecar (.dashboard-config.json). Both keys
+    default to None ("off" — keep forever), matching today's behavior when the
+    file doesn't exist yet. A malformed value self-heals to its default rather
+    than crashing or silently misbehaving."""
+    raw = _read_json_dict(os.path.join(output_dir, CONFIG_FILE))
+    cfg = dict(_CONFIG_DEFAULTS)
+    for k in _CONFIG_DEFAULTS:
+        v = raw.get(k)
+        if v is None:
+            continue
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+            cfg[k] = v
+    return cfg
+
+
+def save_config(output_dir: str, config: dict) -> None:
+    _atomic_write_json(os.path.join(output_dir, CONFIG_FILE), config)
+
+
 def _generator_hash() -> str:
     """Fingerprint of the generator itself (source bytes + timezone) — baked into
     every page fingerprint so a code/TZ change rewrites everything."""
@@ -1537,44 +1629,53 @@ def _session_render_fp(s: Session) -> str:
 
 
 def write_site(sessions: list[Session], output_dir: str,
-               prune_orphans: bool = False) -> tuple[int, int, int, int]:
+               prune_orphans: bool = False,
+               deleted_sids: frozenset = frozenset(),
+               trash: dict | None = None, config: dict | None = None) -> tuple[int, int, int, int]:
     """Render the site incrementally: only sessions whose fingerprint changed (or
     whose files are missing) are re-rendered. Pages of sessions whose source
     .jsonl has disappeared (e.g. pruned by Claude Code's cleanupPeriodDays) are
     KEPT and stay LISTED by default (as an ArchivedCard reconstructed from their
     last-captured card fields, flagged 🗄 archived) — the dashboard doubles as a
     permanent, browsable archive — unless prune_orphans=True, which restores the
-    old mirror-only behavior and deletes them. Returns (written, skipped, pruned,
-    archived)."""
+    old mirror-only behavior and deletes them.
+
+    deleted_sids (the trash, see load_trash/save_trash) is a pure DISPLAY/render
+    filter, not a deletion mechanism: a trashed session's page is neither
+    (re)rendered nor listed, but its manifest/archive-cards entries are carried
+    forward untouched, so restoring it (dropping it from the trash file) makes it
+    reappear with no data loss. The ONLY code that removes files or manifest/
+    archive-cards entries for a trashed session is --empty-trash/purge (batch 2).
+
+    trash/config, when given, are embedded (read-only) into index.html so its
+    Cleanup/Retention/Trash panel can show the current state without a fetch()
+    (this stays a static site — file:// pages can't fetch). If omitted,
+    deleted_sids alone still drives the render filter; the panel just shows an
+    empty/default state, which is what every non-UI test wants.
+
+    Returns (written, skipped, pruned, archived)."""
     sessions_dir = os.path.join(output_dir, "sessions")
     os.makedirs(sessions_dir, exist_ok=True)
     _write_assets(output_dir)
 
     manifest_path = os.path.join(output_dir, RENDER_MANIFEST)
-    manifest: dict = {}
-    if os.path.isfile(manifest_path):
-        try:
-            with open(manifest_path, encoding="utf-8") as fh:
-                manifest = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            manifest = {}
-    if not isinstance(manifest, dict):
-        manifest = {}
+    manifest = _read_json_dict(manifest_path)
 
     cards_path = os.path.join(output_dir, ARCHIVE_CARDS)
-    card_meta: dict = {}
-    if os.path.isfile(cards_path):
-        try:
-            with open(cards_path, encoding="utf-8") as fh:
-                card_meta = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            card_meta = {}
-    if not isinstance(card_meta, dict):
-        card_meta = {}
+    card_meta = _read_json_dict(cards_path)
 
     new_manifest: dict = {}
     written = skipped = 0
     for s in sessions:
+        if s.session_id in deleted_sids:
+            # Trashed: skip render/listing, but carry forward any existing
+            # manifest entry (if this session was rendered before being
+            # trashed) so the page file isn't orphaned out of the ledger and a
+            # future restore doesn't force a needless rewrite. Never touch the
+            # file itself here.
+            if s.session_id in manifest:
+                new_manifest[s.session_id] = manifest[s.session_id]
+            continue
         fp = _session_render_fp(s)
         html_path = os.path.join(sessions_dir, f"{s.session_id}.html")
         md_path = os.path.join(sessions_dir, f"{s.session_id}.md")
@@ -1589,7 +1690,9 @@ def write_site(sessions: list[Session], output_dir: str,
         written += 1
 
     # Card fields (title/cost/tokens/etc.) for every live session, captured every
-    # run so a stub can still be built once its source .jsonl disappears.
+    # run so a stub can still be built once its source .jsonl disappears. Kept
+    # even for a trashed live session (harmless — its card just isn't listed —
+    # and keeps the fields fresh in case it's later restored).
     new_card_meta: dict = {s.session_id: _card_fields(s) for s in sessions}
 
     # Sessions whose source .jsonl is gone (Claude Code pruned it, or it moved).
@@ -1605,6 +1708,18 @@ def write_site(sessions: list[Session], output_dir: str,
     archived_stubs: list[ArchivedCard] = []
     for sid in manifest:
         if sid in current:
+            continue
+        if sid in deleted_sids:
+            # Trashed AND source gone: same soft-delete contract as above — keep
+            # the manifest/card-metadata entries carried forward (so a restore
+            # can rebuild the stub) but don't list it. This takes priority over
+            # prune_orphans: trash is only emptied by --empty-trash/purge, never
+            # by the unrelated --prune-orphans flag.
+            if isinstance(sid, str):
+                new_manifest.setdefault(sid, manifest[sid])
+                fields = card_meta.get(sid)
+                if isinstance(fields, dict):
+                    new_card_meta.setdefault(sid, fields)
             continue
         if not prune_orphans:
             if isinstance(sid, str):
@@ -1631,9 +1746,12 @@ def write_site(sessions: list[Session], output_dir: str,
 
     _atomic_write_json(manifest_path, new_manifest)
     _atomic_write_json(cards_path, new_card_meta)
-    all_cards = sorted([*sessions, *archived_stubs], key=lambda s: s.last_ts, reverse=True)
+    all_cards = sorted(
+        [s for s in sessions if s.session_id not in deleted_sids] + archived_stubs,
+        key=lambda s: s.last_ts, reverse=True)
     # Write index last (atomically) so it never references a half-written page.
-    _atomic_write_text(os.path.join(output_dir, "index.html"), _index_page(all_cards))
+    _atomic_write_text(os.path.join(output_dir, "index.html"),
+                      _index_page(all_cards, trash=trash or {}, config=config or dict(_CONFIG_DEFAULTS)))
     # archived == cards actually listed, NOT every orphan kept on disk (an orphan
     # with no usable card metadata is kept but not counted — see the loop above).
     return written, skipped, pruned, len(archived_stubs)
@@ -1659,8 +1777,25 @@ def _write_assets(output_dir: str) -> None:
         pass
 
 
-def _index_page(sessions: list[Session]) -> str:
+def _fmt_retention(v) -> str:
+    return "off" if v is None else f"{v:g}d"
+
+
+def _input_days_value(v) -> str:
+    """Pre-fill value for the retention/purge number inputs: blank when off (so
+    the placeholder's "off" hint still shows), else the plain number — NOT the
+    "d"-suffixed display string. Pre-filling with the CURRENT setting (rather
+    than leaving both inputs blank) means submitting the field you didn't touch
+    reproduces its existing value instead of silently coercing it to 'off' —
+    the config-loss bug an adversarial review caught in the first draft."""
+    return "" if v is None else f"{v:g}"
+
+
+def _index_page(sessions: list[Session], trash: dict | None = None,
+                config: dict | None = None) -> str:
     generated = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    trash = trash or {}
+    config = config or dict(_CONFIG_DEFAULTS)
 
     # Project list with counts + token/cost rollup, most-recent first (already sorted).
     projects: list[str] = []
@@ -1721,16 +1856,21 @@ def _index_page(sessions: list[Session]) -> str:
         archived_pill = ('<span class="archived-pill" data-tip="Source session was '
                           'removed (e.g. by Claude Code’s 30-day cleanup) — this '
                           'is a saved snapshot">🗄 archived</span>' if is_archived else "")
+        sid_esc = _esc(s.session_id)
+        del_btn = (f'<span class="card-del" data-tip="Delete this session" '
+                   f'onclick="event.preventDefault();event.stopPropagation();'
+                   f'cmdDelete(\'{sid_esc}\')">🗑</span>')
         cards.append(
             f'<a class="card{" active" if idx == 0 else ""}'
             f'{" archived" if is_archived else ""}" href="{href}" target="content" '
             f'onclick="selectCard(this)" style="--phue:{_hue(s.project_name)}" '
+            f'data-sid="{sid_esc}" '
             f'data-project="{_esc(s.project_name)}" data-search="{haystack}" '
             f'data-cost="{s.cost_usd:.4f}" data-tok="{toks}" '
             f'data-inc="{0 if s.cost_complete else 1}">'
             f'<div class="card-top"><span class="proj-badge">{_esc(s.project_name)}</span>'
             f'{sdk_pill}{archived_pill}'
-            f'<span class="date">{badge}{_esc(_fmt_date(s.last_ts))}</span></div>'
+            f'<span class="date">{badge}{_esc(_fmt_date(s.last_ts))}</span>{del_btn}</div>'
             f'<div class="title">{_esc(s.title)}</div>'
             f'<div class="snippet">{_esc(blurb)}</div>'
             f'<div class="meta">{s.n_user} prompts · {s.n_asst} replies{tally}</div>'
@@ -1746,6 +1886,30 @@ def _index_page(sessions: list[Session]) -> str:
         empty = ('<div class="empty">No chat history found under '
                  '<code>~/.claude/projects</code>.</div>')
 
+    # Cleanup/Retention/Trash panel: a command-BUILDER, not a delete button — this
+    # stays a static site (no server, no fetch()), so it can only produce the exact
+    # `chats …` CLI command for the user to copy and run themselves. Trash/config
+    # are embedded read-only at generation time; the panel reflects the state as of
+    # this build and updates after the next regen.
+    trash_rows = []
+    for sid, row in sorted(trash.items(), key=lambda kv: str(kv[1].get("deleted_at", "")), reverse=True):
+        fields = row.get("fields") or {}
+        title = fields.get("title") or "(untitled)"
+        proj = fields.get("project_name") or "?"
+        reason = row.get("reason", "?")
+        deleted_disp = _fmt(row.get("deleted_at", "")) or "?"
+        trash_rows.append(
+            f'<div class="trash-row">'
+            f'<div class="trash-meta"><span class="proj-badge">{_esc(proj)}</span> '
+            f'{_esc(title)} <span class="muted">({_esc(reason)}, {_esc(deleted_disp)})</span></div>'
+            f'<button class="cmd-btn" onclick="cmdRestore(\'{_esc(sid)}\')">Restore</button>'
+            f'</div>'
+        )
+    trash_html = "".join(trash_rows) if trash_rows else '<div class="muted">Trash is empty.</div>'
+    project_options = "".join(f'<option value="{_esc(p)}">{_esc(p)}</option>' for p in projects)
+    retention_disp = _fmt_retention(config.get("retention_days"))
+    purge_disp = _fmt_retention(config.get("purge_days"))
+
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1756,6 +1920,7 @@ def _index_page(sessions: list[Session]) -> str:
   <nav class="projcol">
     <div class="proj-head">
       <h1>Claude Code History</h1>
+      <button id="settingsBtn" class="search-btn" onclick="toggleSettings()" title="Cleanup &amp; trash">⚙</button>
       <button id="searchBtn" class="search-btn" onclick="toggleSearch()" title="Search (/)">🔍</button>
     </div>
     <input id="search" type="search" placeholder="Search…" oninput="runSearch()" hidden>
@@ -1770,6 +1935,54 @@ def _index_page(sessions: list[Session]) -> str:
   </div>
   <div class="resizer" data-pane="sess" title="Drag to resize"></div>
   {right}
+</div>
+<div id="settingsPanel" class="settings-overlay" hidden onclick="if(event.target===this)toggleSettings()">
+  <div class="settings-box">
+    <div class="settings-head"><span>Cleanup &amp; trash</span>
+      <span class="settings-close" onclick="toggleSettings()">✕</span></div>
+    <p class="settings-note">This is a static site — it can't delete files itself. Every action
+      here builds the exact <code>chats</code> command to copy and run yourself.</p>
+    <section>
+      <h3>Bulk cleanup</h3>
+      <div class="settings-row">
+        <label>Older than <input id="bulkDays" type="number" min="0" value="90" style="width:5em">
+          days</label>
+        <button class="cmd-btn" onclick="cmdBulkAge()">Build command</button>
+      </div>
+      <div class="settings-row">
+        <label>Project <select id="bulkProject"><option value="">(choose)</option>
+          {project_options}</select></label>
+        <button class="cmd-btn" onclick="cmdBulkProject()">Build command</button>
+      </div>
+    </section>
+    <section>
+      <h3>Retention</h3>
+      <div class="settings-current">Current: auto-trash {_esc(retention_disp)}
+        · auto-purge {_esc(purge_disp)}</div>
+      <div class="settings-row">
+        <label>Auto-trash after <input id="retDays" type="number" min="0" placeholder="off"
+          value="{_esc(_input_days_value(config.get('retention_days')))}" style="width:5em"> days</label>
+        <label>Auto-purge after <input id="purgeDays" type="number" min="0" placeholder="off"
+          value="{_esc(_input_days_value(config.get('purge_days')))}" style="width:5em"> days</label>
+        <button class="cmd-btn" onclick="cmdRetention()">Build command</button>
+      </div>
+    </section>
+    <section>
+      <h3>Trash ({len(trash)})</h3>
+      <div id="trashList">{trash_html}</div>
+      {'<button class="cmd-btn" onclick="cmdEmptyTrash()">Empty trash (permanent)</button>' if trash else ''}
+    </section>
+  </div>
+</div>
+<div id="cmdDialog" class="cmd-overlay" hidden onclick="if(event.target===this)closeCmdDialog()">
+  <div class="cmd-box">
+    <div class="cmd-title">Run to apply:</div>
+    <code id="cmdText"></code>
+    <div class="cmd-actions">
+      <button class="cmd-btn" onclick="copyCmd()">Copy</button>
+      <button class="cmd-btn" onclick="closeCmdDialog()">Close</button>
+    </div>
+  </div>
 </div>
 <script>{_INDEX_JS}</script>
 </body></html>"""
@@ -2061,6 +2274,10 @@ font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px}
 .card.archived:hover{opacity:1}
 .date{color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px}
 .card-top .date{margin-left:auto}  /* right-pin the date in cards only; header .hmeta stays left-aligned */
+.card-del{flex:none;opacity:0;pointer-events:none;color:var(--muted);cursor:pointer;font-size:12px;
+padding:1px 3px;border-radius:5px;transition:opacity .1s}
+.card:hover .card-del,.card:focus-within .card-del{opacity:.55;pointer-events:auto}
+.card-del:hover{opacity:1 !important;background:var(--code)}
 .active-badge{color:#16a34a;font-weight:700;font-size:10.5px;letter-spacing:.02em}
 @media (prefers-color-scheme:dark){.active-badge{color:#4ade80}}
 .title{font-weight:600;margin-bottom:4px;font-size:14px}
@@ -2116,6 +2333,43 @@ border:1px solid var(--line);border-radius:8px;margin:8px 0;cursor:zoom-in}
 font-size:12px;line-height:1.45;padding:7px 10px;border-radius:7px;pointer-events:none;
 box-shadow:0 4px 16px rgba(0,0,0,.3);white-space:normal}
 #tip[hidden]{display:none}
+/* Cleanup/Retention/Trash panel + the shared command dialog it (and the per-card
+   🗑) both open. Both are simple centered overlays — no server, so every action
+   just builds a `chats …` command string for the user to copy/run. */
+.settings-overlay,.cmd-overlay{position:fixed;inset:0;z-index:1100;background:rgba(0,0,0,.35);
+display:flex;align-items:center;justify-content:center}
+.settings-overlay[hidden],.cmd-overlay[hidden]{display:none}
+.settings-box{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+padding:16px 18px;width:min(480px,92vw);max-height:82vh;overflow:auto;
+box-shadow:0 12px 40px rgba(0,0,0,.35)}
+.settings-head{display:flex;justify-content:space-between;align-items:center;font-weight:700;
+font-size:15px;margin-bottom:4px}
+.settings-close{cursor:pointer;color:var(--muted);font-size:14px;padding:2px 6px;border-radius:6px}
+.settings-close:hover{background:var(--code)}
+.settings-note{color:var(--muted);font-size:12px;margin:4px 0 14px}
+.settings-box section{margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+.settings-box section:last-child{border-bottom:none;margin-bottom:0;padding-bottom:0}
+.settings-box h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);
+margin:0 0 8px}
+.settings-current{font-size:12.5px;color:var(--muted);margin-bottom:8px}
+.settings-row{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:8px;font-size:13px}
+.settings-row label{display:flex;align-items:center;gap:6px}
+.settings-row input,.settings-row select{border:1px solid var(--line);border-radius:6px;
+background:var(--bg);color:var(--ink);padding:3px 6px;font-size:13px}
+.cmd-btn{background:none;border:1px solid var(--line);border-radius:7px;cursor:pointer;
+font-size:12.5px;padding:4px 10px;color:var(--ink)}
+.cmd-btn:hover{border-color:var(--accent)}
+.trash-row{display:flex;justify-content:space-between;align-items:center;gap:10px;
+padding:6px 0;border-bottom:1px solid var(--line);font-size:12.5px}
+.trash-row:last-child{border-bottom:none}
+.trash-meta{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cmd-box{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+padding:16px 18px;width:min(520px,92vw);box-shadow:0 12px 40px rgba(0,0,0,.35)}
+.cmd-title{font-size:12px;color:var(--muted);margin-bottom:6px}
+#cmdText{display:block;background:var(--code);border-radius:8px;padding:10px 12px;
+font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;
+white-space:pre-wrap;word-break:break-all;margin-bottom:12px}
+.cmd-actions{display:flex;gap:8px;justify-content:flex-end}
 .sys-body{white-space:pre-wrap;word-wrap:break-word;margin-top:6px;font-family:ui-monospace,monospace;font-size:12px}
 .cmd{color:var(--muted);font-size:13px;font-family:ui-monospace,monospace}
 .cmd-out{color:var(--muted);font-size:12.5px;font-family:ui-monospace,monospace;
@@ -2272,6 +2526,15 @@ function moveSel(delta){
   vis[idx].scrollIntoView({block:'nearest'});
 }
 document.addEventListener('keydown', e=>{
+  // An open overlay must own the keyboard: otherwise j/k/arrows still navigate
+  // (and click) cards behind it, and '/' opens search behind it too. Escape
+  // closes whichever overlay is open.
+  const cmdOpen = !document.getElementById('cmdDialog').hidden;
+  const settingsOpen = !document.getElementById('settingsPanel').hidden;
+  if(cmdOpen || settingsOpen){
+    if(e.key === 'Escape'){ if(cmdOpen) closeCmdDialog(); else toggleSettings(); }
+    return;
+  }
   const search = document.getElementById('search');
   const inSearch = document.activeElement === search;
   if(inSearch){ if(e.key === 'Escape'){ search.blur(); if(!search.value) toggleSearch(); } return; }
@@ -2321,6 +2584,53 @@ document.addEventListener('keydown', e=>{
   });
   document.addEventListener('mouseout', e => { if (e.target.closest('[data-tip]')) tip.hidden = true; });
 })();
+// Cleanup/Retention/Trash command-builder. This is a static site — it can't
+// delete a file or run a command itself — so every action here only builds
+// the exact `chats …` CLI command text and lets the user copy it. shQuote()
+// wraps any user-controlled string (a project name, in practice) in
+// POSIX-shell-safe single quotes so a stray quote/space/`$` in a directory
+// name can't break — or inject into — the copied command.
+function shQuote(s){ return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
+function showCmd(cmd){
+  document.getElementById('cmdText').textContent = cmd;
+  document.getElementById('cmdDialog').hidden = false;
+}
+function closeCmdDialog(){ document.getElementById('cmdDialog').hidden = true; }
+function copyCmd(){
+  const text = document.getElementById('cmdText').textContent;
+  const fallback = () => {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch(e) {}
+    document.body.removeChild(ta);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(fallback);
+  } else fallback();
+}
+function cmdDelete(sid){ showCmd('chats --delete ' + shQuote(sid)); }
+function cmdRestore(sid){ showCmd('chats --restore ' + shQuote(sid)); }
+function cmdBulkAge(){
+  const days = document.getElementById('bulkDays').value || '0';
+  showCmd('chats --delete-older-than ' + shQuote(days) + ' --dry-run');
+}
+function cmdBulkProject(){
+  const proj = document.getElementById('bulkProject').value;
+  if (!proj) return;
+  showCmd('chats --delete-project ' + shQuote(proj) + ' --dry-run');
+}
+function cmdRetention(){
+  const ret = document.getElementById('retDays').value.trim();
+  const purge = document.getElementById('purgeDays').value.trim();
+  showCmd('chats --set-retention ' + shQuote(ret === '' ? 'off' : ret) +
+          ' --set-purge ' + shQuote(purge === '' ? 'off' : purge));
+}
+function cmdEmptyTrash(){ showCmd('chats --empty-trash --yes'); }
+function toggleSettings(){
+  const p = document.getElementById('settingsPanel');
+  p.hidden = !p.hidden;
+}
 updateHeaders();  // populate date-group tallies on first load (all cards visible)
 """
 
@@ -2458,6 +2768,165 @@ def _atomic_write_json(path: str, data: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Trash CLI helpers
+# --------------------------------------------------------------------------- #
+def _delete_sessions(sids: list[str], sessions: list[Session], output_dir: str,
+                     trash: dict, *, reason: str = "manual") -> int:
+    """Move the given session ids into trash (mutates `trash` in place). Returns
+    the count actually trashed. An id that doesn't match any known session (live
+    or archived) is warned about and skipped — a typo shouldn't silently create a
+    dangling trash entry with no metadata to list or restore."""
+    cards = {c.session_id: c for c in _known_cards(sessions, output_dir)}
+    now = datetime.now().astimezone().isoformat()
+    n = 0
+    for sid in sids:
+        if sid in trash:
+            continue  # already trashed
+        card = cards.get(sid)
+        if card is None:
+            print(f"  warning: no session with id {sid!r} found — skipped", file=sys.stderr)
+            continue
+        trash[sid] = {"deleted_at": now, "reason": reason, "fields": _card_fields(card)}
+        n += 1
+    return n
+
+
+def _restore_sessions(sids: list[str], trash: dict) -> int:
+    """Drop the given ids out of trash (mutates `trash` in place). Returns the
+    count actually restored."""
+    n = 0
+    for sid in sids:
+        if trash.pop(sid, None) is not None:
+            n += 1
+        else:
+            print(f"  warning: {sid!r} is not in trash — skipped", file=sys.stderr)
+    return n
+
+
+def _select_by_age(cards: list, min_days: float) -> list[str]:
+    """Session ids whose last activity is at least min_days old. A card with no
+    parseable last_ts is never selected — safer to under-select than to trash
+    something whose age we can't confirm."""
+    out = []
+    for c in cards:
+        age = _days_since(c.last_ts)
+        if age is not None and age >= min_days:
+            out.append(c.session_id)
+    return out
+
+
+def _select_by_project(cards: list, project_name: str) -> list[str]:
+    return [c.session_id for c in cards if c.project_name == project_name]
+
+
+def _stale_trash_sids(trash: dict, purge_days: float) -> set:
+    """Trash entries whose deleted_at has itself aged past purge_days — shared
+    by the real auto-purge sweep and the --dry-run preview so they can never
+    drift apart. A row with a missing/unparseable deleted_at is never selected
+    (same conservative posture as _select_by_age: under-select, don't guess)."""
+    now = datetime.now().astimezone()
+    stale = set()
+    for sid, row in trash.items():
+        try:
+            dt = datetime.fromisoformat(row.get("deleted_at", ""))
+        except (TypeError, ValueError):
+            continue
+        if (now - dt).total_seconds() / 86400 >= purge_days:
+            stale.add(sid)
+    return stale
+
+
+def _live_ids(sessions: list[Session]) -> set:
+    return {s.session_id for s in sessions}
+
+
+def _warn_reappearing(sids: set) -> None:
+    """--empty-trash/purge only reclaims disk and forgets bookkeeping — it can't
+    make this generator forget a session whose source .jsonl Claude Code still
+    has, since the whole point of the tool is to mirror that source. A sid
+    that's still live will simply be rendered fresh again (no longer flagged
+    trashed) by this very run's write_site() call. Warn rather than silently
+    contradicting "permanently removed" — trash (not empty-trash) is the right
+    tool for "hide this session, recoverably, for good"."""
+    if not sids:
+        return
+    print(f"  note: {len(sids)} of those still exist in Claude Code's own history "
+          f"and will reappear on the next build (their source .jsonl is still present) "
+          f"— trash them again (without emptying) to keep them hidden: "
+          f"{', '.join(sorted(sids))}")
+
+
+def _empty_trash(trash: dict, output_dir: str, only: set | None = None) -> int:
+    """Permanently delete rendered pages for trashed sessions and drop their
+    manifest/archive-cards/trash entries (mutates `trash` in place). Without
+    `only`, purges every trashed session (--empty-trash); with `only`, purges
+    just that subset (used by the auto-purge sweep, which only ages out
+    entries past purge_days, not the whole trash). This is the ONLY code that
+    removes a file or forgets a session's bookkeeping row once it's been
+    soft-deleted — everything else (delete/restore) only adds to or reads the
+    trash file. Reuses the same path-traversal guard as the --prune-orphans
+    loop (a poisoned sid with path parts is refused)."""
+    sessions_dir = os.path.join(output_dir, "sessions")
+    manifest_path = os.path.join(output_dir, RENDER_MANIFEST)
+    cards_path = os.path.join(output_dir, ARCHIVE_CARDS)
+    manifest = _read_json_dict(manifest_path)
+    card_meta = _read_json_dict(cards_path)
+    n = 0
+    target_sids = list(trash) if only is None else [sid for sid in only if sid in trash]
+    for sid in target_sids:
+        for ext in ("html", "md"):
+            fn = f"{sid}.{ext}"
+            if os.path.basename(fn) != fn:  # traversal guard: no path parts
+                continue
+            try:
+                os.remove(os.path.join(sessions_dir, fn))
+            except OSError:
+                pass
+        manifest.pop(sid, None)
+        card_meta.pop(sid, None)
+        trash.pop(sid, None)
+        n += 1
+    _atomic_write_json(manifest_path, manifest)
+    _atomic_write_json(cards_path, card_meta)
+    return n
+
+
+def _print_trash(trash: dict) -> None:
+    if not trash:
+        print("Trash is empty.")
+        return
+    print(f"{len(trash)} session(s) in trash:")
+    # str()-coerce the sort key defensively: load_trash validates deleted_at is a
+    # str, but a caller could hand this a raw/hand-built dict where it isn't —
+    # a mixed-type sort (str vs int) would raise and abort the whole command.
+    for sid, row in sorted(trash.items(),
+                           key=lambda kv: str(kv[1].get("deleted_at", "")), reverse=True):
+        fields = row.get("fields") or {}
+        title = fields.get("title") or "(untitled)"
+        project = fields.get("project_name") or "?"
+        deleted_at = row.get("deleted_at", "?")
+        reason = row.get("reason", "?")
+        print(f"  {sid}  [{reason}]  {project} · {title}  (deleted {deleted_at})")
+
+
+_UNSET = object()  # distinguishes "--set-retention not passed" from "--set-retention off" (None)
+
+
+def _days_or_off(value: str):
+    """argparse type for --set-retention/--set-purge: a non-negative number of
+    days, or the literal 'off' to disable (-> None, meaning keep forever)."""
+    if value.strip().lower() == "off":
+        return None
+    try:
+        days = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number of days or 'off'")
+    if days < 0:
+        raise argparse.ArgumentTypeError("days must be >= 0")
+    return days
+
+
+# --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
 def open_in_browser(path: str) -> None:
@@ -2483,6 +2952,32 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--prune-orphans", action="store_true",
                     help="delete rendered pages whose source session was removed "
                          "(default: keep them as a permanent archive)")
+    ap.add_argument("--delete", nargs="+", metavar="SID",
+                    help="move session(s) to trash — recoverable, unlisted on the "
+                         "next build; use --restore to undo")
+    ap.add_argument("--delete-older-than", type=float, metavar="DAYS",
+                    help="bulk: move every session last active more than DAYS days "
+                         "ago to trash")
+    ap.add_argument("--delete-project", metavar="NAME",
+                    help="bulk: move every session in project NAME to trash")
+    ap.add_argument("--restore", nargs="+", metavar="SID",
+                    help="restore session(s) from trash")
+    ap.add_argument("--list-trash", action="store_true",
+                    help="list trashed sessions and exit")
+    ap.add_argument("--empty-trash", action="store_true",
+                    help="permanently delete every trashed session's rendered pages "
+                         "(hard delete, not recoverable — requires --yes)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="preview a --delete*/--restore/--empty-trash action without "
+                         "changing anything")
+    ap.add_argument("--yes", action="store_true",
+                    help="confirm a destructive action (required for --empty-trash)")
+    ap.add_argument("--set-retention", type=_days_or_off, default=_UNSET, metavar="DAYS|off",
+                    help="auto-trash sessions last active more than DAYS days ago on "
+                         "every build ('off' disables; default: off, keep forever)")
+    ap.add_argument("--set-purge", type=_days_or_off, default=_UNSET, metavar="DAYS|off",
+                    help="permanently delete a session once it's been in trash more than "
+                         "DAYS days ('off' disables; default: off, keep in trash forever)")
     args = ap.parse_args(argv)
 
     if not os.path.isdir(args.projects_dir):
@@ -2495,6 +2990,153 @@ def main(argv: list[str] | None = None) -> int:
 
     os.makedirs(args.output_dir, exist_ok=True)
     index = os.path.join(args.output_dir, "index.html")
+    trash = load_trash(args.output_dir)
+    config = load_config(args.output_dir)
+
+    # Compute the settings change WITHOUT saving yet — --dry-run must preview
+    # with truly zero side effects, config included, like every action below.
+    new_config = dict(config)
+    config_dirty = False
+    if args.set_retention is not _UNSET:
+        new_config["retention_days"] = args.set_retention
+        config_dirty = True
+    if args.set_purge is not _UNSET:
+        new_config["purge_days"] = args.set_purge
+        config_dirty = True
+    if config_dirty and new_config.get("purge_days") == 0:
+        print("  warning: --set-purge 0 permanently deletes every trashed session's "
+              "pages on every future build, with no further confirmation.", file=sys.stderr)
+    if config_dirty and new_config.get("retention_days") == 0:
+        print("  warning: --set-retention 0 auto-trashes every session with a "
+              "parseable timestamp on every future build.", file=sys.stderr)
+
+    if args.list_trash:
+        _print_trash(trash)
+        return 0
+
+    if args.empty_trash and not (args.yes or args.dry_run):
+        print("--empty-trash permanently deletes trashed sessions' pages — this "
+              "cannot be undone. Re-run with --yes to confirm, or --dry-run to preview.",
+              file=sys.stderr)
+        return 1
+
+    # Gather every id targeted by a manual or bulk delete this run WITHOUT
+    # mutating `trash` yet, so --dry-run can preview with zero side effects.
+    known = _known_cards(sessions, args.output_dir)
+    to_delete: list[str] = list(args.delete or [])
+    if args.delete_older_than is not None:
+        to_delete += _select_by_age(known, args.delete_older_than)
+    if args.delete_project:
+        to_delete += _select_by_project(known, args.delete_project)
+    seen: set = set()
+    to_delete = [sid for sid in to_delete if not (sid in seen or seen.add(sid))]
+
+    if args.dry_run:
+        did_anything = False
+        if config_dirty:
+            print(f"Would set retention_days={new_config['retention_days']!r}, "
+                  f"purge_days={new_config['purge_days']!r}")
+            did_anything = True
+        if to_delete:
+            print(f"Would trash {len(to_delete)} session(s):")
+            for sid in to_delete:
+                print(f"  {sid}")
+            did_anything = True
+        if args.restore:
+            print(f"Would restore {len(args.restore)} session(s): {', '.join(args.restore)}")
+            did_anything = True
+        if args.empty_trash:
+            print(f"Would permanently delete {len(trash)} trashed session(s)'s pages.")
+            did_anything = True
+        # Preview what the config-driven auto-sweep would ALSO do on a real run
+        # (using the settings this same invocation would apply, so a combined
+        # `--set-retention N --dry-run` previews accurately) — otherwise a
+        # dry-run can print "nothing to do" while the very next real build
+        # silently auto-trashes/purges a pile of sessions.
+        effective_retention = new_config["retention_days"]
+        effective_purge = new_config["purge_days"]
+        if effective_retention is not None:
+            restoring = set(args.restore or [])
+            auto_preview = [sid for sid in _select_by_age(known, effective_retention)
+                           if sid not in trash and sid not in restoring]
+            if auto_preview:
+                print(f"Auto-retention would additionally trash {len(auto_preview)} "
+                      f"session(s) inactive {effective_retention:g}+ days:")
+                for sid in auto_preview:
+                    print(f"  {sid}")
+                did_anything = True
+        if effective_purge is not None:
+            stale_preview = _stale_trash_sids(trash, effective_purge)
+            if stale_preview:
+                print(f"Auto-purge would additionally permanently remove "
+                      f"{len(stale_preview)} trashed session(s) older than "
+                      f"{effective_purge:g} days in trash.")
+                did_anything = True
+        if not did_anything:
+            print("Nothing to do (no --delete/--delete-older-than/--delete-project/"
+                  "--restore/--empty-trash/--set-retention/--set-purge given).")
+        return 0
+
+    if config_dirty:
+        config = new_config
+        save_config(args.output_dir, config)
+        print(f"  retention_days={config['retention_days']!r}, purge_days={config['purge_days']!r}")
+
+    trash_dirty = False
+    if to_delete:
+        n = _delete_sessions(to_delete, sessions, args.output_dir, trash, reason="manual")
+        print(f"  trashed {n}/{len(to_delete)} session(s).")
+        trash_dirty = True
+        save_trash(args.output_dir, trash)
+    if args.restore:
+        n = _restore_sessions(args.restore, trash)
+        print(f"  restored {n}/{len(args.restore)} session(s).")
+        trash_dirty = True
+        save_trash(args.output_dir, trash)  # persist promptly: shrinks the crash window
+    if args.empty_trash:
+        reappearing = _live_ids(sessions) & set(trash)
+        n = _empty_trash(trash, args.output_dir)
+        print(f"  permanently removed {n} trashed session(s).")
+        _warn_reappearing(reappearing)
+        trash_dirty = True
+        save_trash(args.output_dir, trash)
+
+    # Automatic, config-driven housekeeping (never reached under --dry-run — that
+    # returns above — so a preview run changes nothing at all). Retention moves
+    # sessions inactive past retention_days into trash (still recoverable); purge
+    # then hard-deletes trash entries that have themselves aged past purge_days.
+    # Both are off (None) by default, so this is a no-op until the user opts in.
+    # A session named in THIS run's --restore is exempt from the same-run sweep —
+    # otherwise an explicit restore of an old session would be silently undone
+    # before the command even finishes (auto-retention would just re-select it).
+    just_restored = set(args.restore or [])
+    if config["retention_days"] is not None:
+        aged = set(_select_by_age(known, config["retention_days"]))
+        auto_sids = [sid for sid in aged if sid not in trash and sid not in just_restored]
+        if auto_sids:
+            n = _delete_sessions(auto_sids, sessions, args.output_dir, trash, reason="retention")
+            if n:
+                print(f"  retention: auto-trashed {n} session(s) inactive for "
+                      f"{config['retention_days']:g}+ days.")
+                trash_dirty = True
+                save_trash(args.output_dir, trash)
+        still_old = aged & just_restored
+        if still_old:
+            print(f"  note: {len(still_old)} restored session(s) are still past the "
+                  f"current retention_days={config['retention_days']:g} — a later build "
+                  f"(without --restore) will auto-trash them again unless you raise or "
+                  f"disable retention: {', '.join(sorted(still_old))}")
+
+    if config["purge_days"] is not None:
+        stale = _stale_trash_sids(trash, config["purge_days"])
+        if stale:
+            reappearing = _live_ids(sessions) & stale
+            n = _empty_trash(trash, args.output_dir, only=stale)
+            print(f"  purge: permanently removed {n} session(s) trashed for "
+                  f"{config['purge_days']:g}+ days.")
+            _warn_reappearing(reappearing)
+            trash_dirty = True
+            save_trash(args.output_dir, trash)
 
     # Resolve cached/heuristic titles instantly (no network), render, and open — so
     # the dashboard appears right away. Only genuinely new/cold sessions need a slow
@@ -2504,9 +3146,11 @@ def main(argv: list[str] | None = None) -> int:
     todo: list[tuple[Session, str, str]] = []
     if not args.no_titles:
         cache, cache_path, todo = resolve_cached_titles(sessions, args.output_dir)
+        todo = [t for t in todo if t[0].session_id not in trash]  # don't spend on trashed sessions
 
     written, skipped, pruned, archived = write_site(
-        sessions, args.output_dir, prune_orphans=args.prune_orphans)
+        sessions, args.output_dir, prune_orphans=args.prune_orphans,
+        deleted_sids=frozenset(trash), trash=trash, config=config)
     stats = f"{written} page(s) rendered, {skipped} unchanged"
     if pruned:
         stats += f", {pruned} stale file(s) pruned"
@@ -2519,7 +3163,8 @@ def main(argv: list[str] | None = None) -> int:
     if todo:
         if generate_titles(todo, cache, cache_path, args.title_model):
             # rewrite with the fresh titles
-            write_site(sessions, args.output_dir, prune_orphans=args.prune_orphans)
+            write_site(sessions, args.output_dir, prune_orphans=args.prune_orphans,
+                      deleted_sids=frozenset(trash), trash=trash, config=config)
             print(f"  titles updated for {len(todo)} session(s) — "
                   f"refresh the dashboard to see them.")
     return 0

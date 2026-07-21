@@ -47,6 +47,31 @@ the sane default. `.render-manifest.json` drives incremental skip-if-unchanged r
 `.archive-cards.json`, `.title-cache.json`) live alongside `index.html` in the output dir and are
 generator-owned (never hand-edit).
 
+**Deletion, trash, and retention (added 2026-07-20):** the opposite control — removing sessions the
+user doesn't want. Deletion is **soft**: `--delete SID...` (or bulk `--delete-older-than DAYS` /
+`--delete-project NAME`) moves a session into `.deleted-sessions.json` (the trash), a pure
+display/render filter applied in `write_site(deleted_sids=...)` — the rendered page is neither
+re-rendered nor listed, but its `.render-manifest.json`/`.archive-cards.json` entries are carried
+forward untouched, so `--restore SID...` (dropping it back out of trash) always brings it back
+losslessly. **Trash only ever ADDS; the only code that hard-deletes pages and drops bookkeeping
+entries is `--empty-trash` (gated behind `--yes` or `--dry-run`) or the automatic purge sweep** —
+both go through `_empty_trash()`, which reuses the `--prune-orphans` path-traversal guard. Note: if
+a session's source `.jsonl` is still live when purged, this same run's `write_site()` re-renders it
+fresh afterward (the tool mirrors the source; it can't forget a session Claude Code still has) —
+`main()` prints a `_warn_reappearing()` note when this happens. `--list-trash` prints the trash;
+`--dry-run` previews any of the above (including what the config-driven sweep below would ALSO do)
+with zero side effects. `.dashboard-config.json` holds `retention_days`/`purge_days` (both `null` =
+off = today's keep-forever behavior), set via `--set-retention DAYS|off` / `--set-purge DAYS|off`;
+every normal build then auto-trashes sessions older than `retention_days` (reason `"retention"`,
+still recoverable) and auto-purges trash entries whose `deleted_at` has itself aged past
+`purge_days`. A session named in the same invocation's `--restore` is exempt from that same run's
+auto-retention sweep (otherwise an explicit restore of an old session would be silently undone
+before the command finished — a real bug caught by adversarial review, since fixed and regression-
+tested). The browser can't delete files itself (no server) — `index.html` embeds the trash list +
+config read-only and offers a **command-builder UI** (⚙ panel, per-card 🗑) that builds the exact
+`chats …` CLI command with a Copy button; `shQuote()` POSIX-shell-quotes any embedded user string
+(project names) before it's shown. All five dotfiles are generator-owned; never hand-edit.
+
 ## Three entry points (least-Claude first)
 1. Open the bookmarked `~/.claude/history-dashboard/index.html` (last snapshot — no Claude).
 2. `chats` shell alias → `python3 ~/claude/export_chat/chats_dashboard.py --open` (refresh+view, no Claude).

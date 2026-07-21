@@ -151,6 +151,7 @@ Show total tokens used, cache hits, model used — useful for cost-awareness. **
 ---
 
 ## Closed (full detail → `IMPROVEMENTS_DONE.md`)
+- Session deletion, trash/recovery, retention, and bulk-delete (soft-delete trash, `--delete`/`--restore`/`--list-trash`/`--delete-older-than`/`--delete-project`/`--empty-trash`/`--dry-run`, auto-retention/purge config, browser command-builder UI) — Built 2026-07-20
 - AskUserQuestion card: custom-typed answers + notes now shown (were invisible); crash-hardened against malformed `toolUseResult`; also resolves the 2026-06-13 "chose to discuss instead" outcome item — Built 2026-07-15
 - Dashboard becomes a durable, browsable archive (kept + listed past Claude Code's 30-day cleanup) — Built 2026-07-14
 - Interrupts / compact summaries / pasted images / agent-name / TodoWrite→Task* / plan outcome badges / tool-chip summaries / per-turn model+duration — Built 2026-07-09 (codebase review)

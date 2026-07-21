@@ -16,6 +16,8 @@ Claude Code stores every session as a JSONL file under `~/.claude/projects/`. Th
 - **Dark/light mode** — respects your system preference
 - **SDK session detection** — badges sessions initiated programmatically (via `claude -p`) vs typed by you
 - **Active session indicator** — highlights sessions with recent activity
+- **Durable archive** — Claude Code itself deletes session files after ~30 days; this dashboard keeps and lists them anyway (flagged 🗄 archived), so your history survives past that cleanup
+- **Delete, restore, and retention** — soft-delete sessions you don't want (recoverable), bulk-delete by age or project, and optionally auto-trash sessions past a retention period — all from the CLI or a command-builder panel in the browser (see [Managing sessions](#managing-sessions-delete-restore-retention) below)
 
 All output is plain HTML/CSS/JS — no build step, no bundler, no runtime dependencies beyond Python's standard library.
 
@@ -40,11 +42,25 @@ The dashboard is written to `~/.claude/history-dashboard/` by default. You can b
 python3 chats_dashboard.py [options]
 
 Options:
-  --open                Open the dashboard in your browser when done
-  --no-titles           Skip LLM title generation (use heuristic titles)
-  --title-model MODEL   Model for title generation (default: haiku)
-  --projects-dir DIR    Claude Code projects directory (default: ~/.claude/projects)
-  --output-dir DIR      Output directory (default: ~/.claude/history-dashboard)
+  --open                    Open the dashboard in your browser when done
+  --no-titles               Skip LLM title generation (use heuristic titles)
+  --title-model MODEL       Model for title generation (default: haiku)
+  --projects-dir DIR        Claude Code projects directory (default: ~/.claude/projects)
+  --output-dir DIR          Output directory (default: ~/.claude/history-dashboard)
+  --prune-orphans           Delete rendered pages whose source session was removed
+                            (default: keep them as a permanent archive)
+
+Deleting, restoring, and retention (see below for details):
+  --delete SID...           Move session(s) to trash (recoverable)
+  --delete-older-than DAYS  Bulk: trash every session inactive more than DAYS days
+  --delete-project NAME     Bulk: trash every session in project NAME
+  --restore SID...          Restore session(s) from trash
+  --list-trash              List trashed sessions and exit
+  --empty-trash             Permanently delete every trashed session (requires --yes)
+  --dry-run                 Preview a delete/restore/empty-trash action, change nothing
+  --yes                     Confirm a destructive action (required for --empty-trash)
+  --set-retention DAYS|off  Auto-trash sessions inactive past DAYS days on every build
+  --set-purge DAYS|off      Auto-delete a trashed session once it's been in trash DAYS days
 ```
 
 ### Command shortcut (recommended)
@@ -89,7 +105,9 @@ Copy-Item chats.md $env:USERPROFILE\.claude\commands\chats.md
 2. Groups entries by `sessionId` (merging resumed sessions)
 3. Computes metadata: timestamps, token counts, cost estimates, snippets
 4. Optionally generates titles via `claude -p --model haiku` (cached by content fingerprint)
-5. Writes a static site:
+5. Merges in any sessions whose source `.jsonl` has since disappeared (reconstructed as archived
+   stubs from a saved snapshot) and filters out anything currently in the trash
+6. Writes a static site:
    - `index.html` — main dashboard with project sidebar, session cards, and iframe viewer
    - `sessions/<id>.html` — individual transcript pages
    - `sessions/<id>.md` — markdown exports
@@ -110,6 +128,10 @@ Files are written atomically (temp file + `os.replace`); `index.html` is written
     └── <session-id>.md     # Per-session markdown export
 ```
 
+A handful of hidden `.json` state files also live in the output directory (render cache, archived-
+session snapshots, trash, retention settings). They're generator-owned — never hand-edit them, but
+it's always safe to delete the whole output directory and re-run for a clean rebuild.
+
 ## Cost tracking
 
 The dashboard estimates costs using public Claude API list prices. Models tracked:
@@ -122,6 +144,42 @@ The dashboard estimates costs using public Claude API list prices. Models tracke
 | Haiku 4.5 | $1.00 | $5.00 |
 
 Cache reads are priced at 10% of input; cache writes at 125% of input. Sessions using unrecognized models show token counts but no dollar estimate.
+
+## Managing sessions: delete, restore, retention
+
+Deletion is **soft** and always recoverable: `--delete` moves a session into a trash file rather
+than touching its rendered page. A regen won't pull it back in, but nothing is actually destroyed
+until you explicitly empty the trash.
+
+```bash
+# Delete one or more sessions (recoverable)
+python3 chats_dashboard.py --delete <session-id>
+
+# Bulk delete by age or project — preview first with --dry-run
+python3 chats_dashboard.py --delete-older-than 90 --dry-run
+python3 chats_dashboard.py --delete-older-than 90
+python3 chats_dashboard.py --delete-project my-old-project
+
+# See what's in the trash, and undo a deletion
+python3 chats_dashboard.py --list-trash
+python3 chats_dashboard.py --restore <session-id>
+
+# Reclaim disk permanently (irreversible — requires --yes)
+python3 chats_dashboard.py --empty-trash --yes
+
+# Auto-trash sessions inactive past N days on every future build (still recoverable),
+# and/or auto-delete trash entries themselves once they've sat there past M days.
+# Both are off by default — nothing changes until you opt in.
+python3 chats_dashboard.py --set-retention 90 --set-purge 30
+python3 chats_dashboard.py --set-retention off --set-purge off   # turn both back off
+```
+
+The dashboard is a static site with no server, so it can't delete anything from the browser
+itself — instead, `index.html` has a ⚙ **Cleanup & trash** panel (and a 🗑 on each session card)
+that build the exact command above for you to copy and run. If a session's source `.jsonl` is
+still present in `~/.claude/projects` when you empty the trash, it will simply reappear on the
+next build — the dashboard mirrors Claude Code's own history and can't forget something Claude
+Code still has; the CLI prints a note when this happens.
 
 ## Requirements
 
@@ -137,7 +195,7 @@ Cache reads are priced at 10% of input; cache writes at 125% of input. Sessions 
 python3 -m unittest discover -s tests
 ```
 
-48 tests covering attribution logic, markdown rendering, cost math, date handling, and output structure. All tests use synthetic fixtures (no real chat data).
+173 tests covering attribution logic, markdown rendering, cost math, date handling, incremental rendering, the archive/trash/retention lifecycle, and output structure. All tests use synthetic fixtures (no real chat data).
 
 ## License
 
