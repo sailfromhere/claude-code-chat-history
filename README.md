@@ -114,6 +114,27 @@ Copy-Item chats.md $env:USERPROFILE\.claude\commands\chats.md
 
 Files are written atomically (temp file + `os.replace`); `index.html` is written last.
 
+### Project grouping
+
+A "project" is just a distinct working directory: Claude Code stamps every session with the
+`cwd` it was started in, and this tool groups sessions by that value (`basename(cwd)`), not by
+the on-disk `~/.claude/projects/<dir>` folder name. This works no matter how you organize your
+own project folders — one directory per project, everything under one parent, or anything else
+— each distinct `cwd` becomes its own project group. Running every session from the same
+directory (including your home directory) will group them all as one project, since Claude Code
+records no project concept beyond `cwd`.
+
+**Renaming a project folder** does not merge its history automatically — sessions recorded
+before the rename keep the old `cwd`, so they'd otherwise show up as a separate, orphaned
+project. To fold them into the renamed project, create a `project-aliases.local.json` next to
+`chats_dashboard.py` (gitignored — it holds real local paths):
+
+```json
+{
+  "/old/absolute/path/to/project": "/new/absolute/path/to/project"
+}
+```
+
 ## Output structure
 
 ```

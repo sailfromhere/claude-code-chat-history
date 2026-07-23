@@ -19,3 +19,7 @@ TODO.md
 CLAUDE.md
 IMPROVEMENTS.md
 IMPROVEMENTS_DONE.md
+
+# Personal project-rename aliases (real local paths) — see chats_dashboard.py
+# PROJECT_ALIASES loader.
+project-aliases.local.json

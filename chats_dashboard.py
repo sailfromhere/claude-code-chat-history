@@ -41,10 +41,20 @@ DEFAULT_OUTPUT_DIR = os.path.join(HOME, ".claude", "history-dashboard")
 # Fold a renamed/moved project's old cwd into its current one so sessions that
 # ran before a rename don't show up as a separate project. Maps an old absolute
 # cwd (as recorded in the .jsonl `cwd` field) → the canonical current cwd.
-# Trailing slashes are ignored. Add a line here whenever you rename a project.
-PROJECT_ALIASES = {
-    "/Users/kevinyu/claude/ticket_snagger": "/Users/kevinyu/claude/ticket_snagger_recreation_gov",
-}
+# Trailing slashes are ignored. Populated from an optional, gitignored
+# project-aliases.local.json next to this script — {"old/cwd": "new/cwd", ...} —
+# so personal paths never land in tracked source. Add an entry there whenever
+# you rename a project folder.
+def _load_project_aliases() -> dict[str, str]:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "project-aliases.local.json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+PROJECT_ALIASES: dict[str, str] = _load_project_aliases()
 
 # Cap per-block content so a 2 MB session doesn't produce an enormous DOM.
 # Full content always remains in the original .jsonl.
