@@ -13,3 +13,9 @@ __pycache__/
 
 # Personal real-world checklist (global rule: never tracked)
 TODO.md
+
+# Repo went public (2026-07-22) — internal docs/backlog untracked going forward.
+# History still holds old revisions (verified public repo already; not rewritten).
+CLAUDE.md
+IMPROVEMENTS.md
+IMPROVEMENTS_DONE.md
